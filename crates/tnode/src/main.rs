@@ -8,6 +8,9 @@ use serde::Deserialize;
 // Read from Cargo.toml at compile time so --tnode-version always matches the crate version.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// Embedded at compile-time for instant, zero-latency changelog rendering.
+const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
+
 macro_rules! log_err {
     ($($arg:tt)*) => {
         eprintln!("\x1b[31m[tnode:ERROR]\x1b[0m {}", format_args!($($arg)*));
@@ -92,6 +95,8 @@ DESCRIPTION:
 TNODE FLAGS:
     --tnode-help       Print this help message and exit.
     --tnode-version    Print version information and exit.
+    --tnode-update     Check and install the latest TNode release automatically.
+    --tnode-changelog  Display the version changelog panel.
     --tnode-lib <path> Use a custom `libthook.so` path instead of auto-discovery.
     --tnode-tmp <path> Set a custom temporary directory for ELF caching bypass.
     --tnode-log <path> Output debug logs to the specified path.
@@ -106,6 +111,8 @@ TNODE FLAGS:
 
 EXAMPLES:
     tnode npm install canvas
+    tnode --tnode-update
+    tnode --tnode-changelog
     tnode --tnode-debug trace --tnode-log ./debug.log npx prisma db push
     tnode --tnode-clean
     eval "$(tnode --tnode-env-export)"
@@ -117,16 +124,313 @@ fn print_version() {
     println!("tnode version {}", VERSION);
 }
 
+/// Returns the path to the user's tnode cache directory (`~/.cache/tnode`).
+fn get_cache_dir() -> PathBuf {
+    let base = env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/data/data/com.termux/files/home"));
+    let dir = base.join(".cache").join("tnode");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+/// Displays the changelog with colored indicators for Added (green), Changed (blue), Removed (red).
+fn print_changelog(target_version: Option<&str>) {
+    let target = target_version.map(|v| v.trim_start_matches('v'));
+    let mut in_target = target.is_none();
+    let mut found = false;
+    let mut current_section = "";
+    let mut last_printed_section = "";
+
+    for line in CHANGELOG.lines() {
+        if line.starts_with("## [") {
+            if let Some(end_bracket) = line.find(']') {
+                let ver = &line[4..end_bracket];
+                let date = line.find(" - ").map(|idx| &line[idx + 3..]).unwrap_or("");
+                current_section = "";
+                last_printed_section = "";
+
+                if let Some(tgt) = target {
+                    if ver == tgt {
+                        if found {
+                            break;
+                        }
+                        in_target = true;
+                        found = true;
+                        println!("\x1b[1mv{}\x1b[0m  \x1b[2m{}\x1b[0m", ver, date);
+                        println!("\x1b[2m────────────────────────────────────────────────────\x1b[0m");
+                    } else {
+                        in_target = false;
+                    }
+                } else {
+                    if found {
+                        println!();
+                    }
+                    found = true;
+                    println!("\x1b[1mv{}\x1b[0m  \x1b[2m{}\x1b[0m", ver, date);
+                    println!("\x1b[2m────────────────────────────────────────────────────\x1b[0m");
+                    in_target = true;
+                }
+            }
+            continue;
+        }
+
+        if !in_target {
+            continue;
+        }
+
+        if line.starts_with("### ") {
+            current_section = line[4..].trim();
+            continue;
+        }
+
+        if line.starts_with("- ") {
+            if !last_printed_section.is_empty() && last_printed_section != current_section {
+                println!();
+            }
+            last_printed_section = current_section;
+            let entry = line[2..].trim();
+            match current_section {
+                "Added" => println!("  \x1b[32m●\x1b[0m  \x1b[37m{}\x1b[0m", entry),
+                "Changed" => println!("  \x1b[34m●\x1b[0m  \x1b[37m{}\x1b[0m", entry),
+                "Removed" => println!("  \x1b[31m●\x1b[0m  \x1b[37m{}\x1b[0m", entry),
+                _ => println!("  \x1b[37m{}\x1b[0m", entry),
+            }
+        }
+    }
+
+    if found {
+        println!();
+        println!("  \x1b[32m●\x1b[0m \x1b[2madded\x1b[0m   \x1b[34m●\x1b[0m \x1b[2mchanged\x1b[0m   \x1b[31m●\x1b[0m \x1b[2mremoved\x1b[0m");
+        println!();
+    } else if let Some(tgt) = target {
+        println!("[tnode] No changelog entry found for version v{}", tgt);
+    }
+}
+
+/// On startup, checks if the changelog for the current version has been shown.
+/// If not, displays the changelog once and saves the current version.
+fn check_and_show_new_changelog() {
+    let cache_dir = get_cache_dir();
+    let file_path = cache_dir.join("last_shown_changelog");
+    let last_shown = fs::read_to_string(&file_path).unwrap_or_default().trim().to_string();
+    if last_shown != VERSION {
+        print_changelog(Some(VERSION));
+        let _ = fs::write(&file_path, VERSION);
+    }
+}
+
+/// Detects the target CPU architecture.
+fn detect_arch() -> Result<String, String> {
+    match env::consts::ARCH {
+        "aarch64" => Ok("aarch64".to_string()),
+        "x86_64" => Ok("x86_64".to_string()),
+        other => Err(format!("Unsupported architecture: {}", other)),
+    }
+}
+
+/// Detects the target platform (android or linux).
+fn detect_platform() -> Result<String, String> {
+    match env::consts::OS {
+        "linux" | "android" => {
+            if Path::new("/data/data/com.termux").exists() || env::var("TERMUX_VERSION").is_ok() {
+                Ok("android".to_string())
+            } else {
+                Ok("linux".to_string())
+            }
+        }
+        "macos" | "darwin" => Err("macOS is not supported because LD_PRELOAD is restricted by macOS SIP.".to_string()),
+        other => Err(format!("Unsupported platform: {}", other)),
+    }
+}
+
+/// Fetches the latest release tag_name from GitHub API via curl.
+fn fetch_latest_release_tag() -> Option<String> {
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--retry", "3",
+            "https://api.github.com/repos/Irithell/tnode/releases/latest",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("\"tag_name\"") {
+            if let Some(start) = line.find(':') {
+                let rest = line[start + 1..].trim();
+                let tag = rest.trim_matches(|c| c == '"' || c == ',' || c == ' ');
+                if !tag.is_empty() {
+                    return Some(tag.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Performs a self-update of tnode and libthook.so using atomic rename.
+fn handle_update() {
+    println!("\x1b[36m[tnode]\x1b[0m Checking for updates...");
+
+    let latest_tag = match fetch_latest_release_tag() {
+        Some(tag) => tag,
+        None => {
+            log_err!("Failed to resolve latest version from GitHub API.");
+            exit(1);
+        }
+    };
+
+    let latest_ver = latest_tag.trim_start_matches('v');
+    if latest_ver == VERSION {
+        println!("\x1b[32m[tnode]\x1b[0m TNode is already up to date (v{}).", VERSION);
+        exit(0);
+    }
+
+    println!("\x1b[36m[tnode]\x1b[0m Updating TNode v{} -> {}...", VERSION, latest_tag);
+
+    let current_bin = match env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            log_err!("Failed to resolve current binary path: {}", e);
+            exit(1);
+        }
+    };
+
+    let bin_dir = current_bin.parent().unwrap_or_else(|| Path::new("/data/data/com.termux/files/usr/bin"));
+    let lib_dir = bin_dir.parent().map(|p| p.join("lib")).unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/usr/lib"));
+    let target_lib = lib_dir.join("libthook.so");
+
+    let arch = match detect_arch() {
+        Ok(a) => a,
+        Err(e) => {
+            log_err!("{}", e);
+            exit(1);
+        }
+    };
+    let platform = match detect_platform() {
+        Ok(p) => p,
+        Err(e) => {
+            log_err!("{}", e);
+            exit(1);
+        }
+    };
+
+    let bin_asset = format!("tnode-{}-{}", arch, platform);
+    let lib_asset = format!("libthook-{}-{}.so", arch, platform);
+    let base_url = format!("https://github.com/Irithell/tnode/releases/download/{}/", latest_tag);
+
+    let tmp_dir = env::var("THOOK_TMPDIR").unwrap_or_else(|_| env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string()));
+    let update_tmp = PathBuf::from(&tmp_dir).join("tnode_update_download");
+    let _ = fs::create_dir_all(&update_tmp);
+
+    let tmp_bin = update_tmp.join("tnode");
+    let tmp_lib = update_tmp.join("libthook.so");
+
+    println!("\x1b[36m[tnode]\x1b[0m Downloading {}...", bin_asset);
+    let status = Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "--progress-bar", "-o", tmp_bin.to_str().unwrap(), &format!("{}{}", base_url, bin_asset)])
+        .status();
+    if status.map(|s| !s.success()).unwrap_or(true) {
+        log_err!("Failed to download binary asset: {}", bin_asset);
+        exit(1);
+    }
+
+    println!("\x1b[36m[tnode]\x1b[0m Downloading {}...", lib_asset);
+    let status = Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "--progress-bar", "-o", tmp_lib.to_str().unwrap(), &format!("{}{}", base_url, lib_asset)])
+        .status();
+    if status.map(|s| !s.success()).unwrap_or(true) {
+        log_err!("Failed to download library asset: {}", lib_asset);
+        exit(1);
+    }
+
+    // Atomic replacement helper
+    let replace_file = |src: &Path, dst: &Path| -> Result<(), String> {
+        let parent = dst.parent().ok_or_else(|| "Invalid destination directory".to_string())?;
+        let _ = fs::create_dir_all(parent);
+        let temp_dst = parent.join(format!(".tmp_replace_{}", dst.file_name().unwrap().to_string_lossy()));
+        if let Err(e) = fs::copy(src, &temp_dst) {
+            return Err(format!("Failed to write to destination directory: {}", e));
+        }
+        if let Err(e) = fs::rename(&temp_dst, dst) {
+            let _ = fs::remove_file(&temp_dst);
+            return Err(format!("Failed to replace {}: {}", dst.display(), e));
+        }
+        Ok(())
+    };
+
+    println!("\x1b[36m[tnode]\x1b[0m Installing update...");
+    if let Err(e) = replace_file(&tmp_bin, &current_bin) {
+        log_err!("{}", e);
+        exit(1);
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(mut perms) = fs::metadata(&current_bin).map(|m| m.permissions()) {
+        perms.set_mode(0o755);
+        let _ = fs::set_permissions(&current_bin, perms);
+    }
+
+    if let Err(e) = replace_file(&tmp_lib, &target_lib) {
+        log_err!("{}", e);
+        exit(1);
+    }
+
+    let _ = fs::remove_dir_all(&update_tmp);
+
+    // Reset last_shown_changelog so new changelog displays on next invocation
+    let cache_dir = get_cache_dir();
+    let _ = fs::write(cache_dir.join("last_shown_changelog"), "");
+
+    println!("\x1b[32m[tnode]\x1b[0m Successfully updated to {}!", latest_tag);
+}
+
+/// Spawns a background thread to check for updates if 24h have passed since last check.
+fn check_updates_background() {
+    let cache_dir = get_cache_dir();
+    let last_check_file = cache_dir.join("last_check");
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return,
+    };
+
+    let last_check: u64 = fs::read_to_string(&last_check_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    if now > last_check + 86400 {
+        std::thread::spawn(move || {
+            if let Some(tag) = fetch_latest_release_tag() {
+                let cache_dir = get_cache_dir();
+                let _ = fs::write(cache_dir.join("latest_version"), &tag);
+                let _ = fs::write(cache_dir.join("last_check"), now.to_string());
+            }
+        });
+    }
+}
+
+/// Prints update notification on stderr if a newer version tag was found in cache.
+fn print_pending_update_notice() {
+    let cache_dir = get_cache_dir();
+    let latest_file = cache_dir.join("latest_version");
+    if let Ok(tag) = fs::read_to_string(&latest_file) {
+        let tag = tag.trim();
+        let ver = tag.trim_start_matches('v');
+        if !ver.is_empty() && ver != VERSION {
+            eprintln!("\n\x1b[36m[tnode]\x1b[0m update available: v{} -> {}", VERSION, tag);
+            eprintln!("\x1b[36m[tnode]\x1b[0m run: tnode --tnode-update\n");
+        }
+    }
+}
+
 /// Runs the `--tnode-doctor` diagnostic suite.
-///
-/// Checks the following in order:
-/// 1. `libthook.so` existence at the resolved path.
-/// 2. `$TMPDIR` write access (creates it if absent).
-/// 3. Presence of `bridge.toml` in the current directory.
-/// 4. Availability of common tools (`node`, `npm`, `clang`, `python`, `bun`, `git`) in `$PATH`.
-/// 5. Whether the current working directory is on an SDCARD FUSE filesystem.
-///
-/// Exits with 0 if no critical errors are found, 1 otherwise.
 fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path: Option<&PathBuf>, resolved_tmp: &str) {
     println!("\x1b[35m=== TNode System & Environment Doctor ===\x1b[0m\n");
     let mut errors = 0;
@@ -138,11 +442,11 @@ fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path
         if path.exists() {
             println!("\x1b[32m[OK]\x1b[0m Found at {}", path.display());
         } else {
-            println!("\x1b[31m[ERROR]\x1b[0m Configured/found path does not exist: {}", path.display());
+            println!("\x1b[31m[ERROR]\x1b[0m Path resolved to {} but file does not exist.", path.display());
             errors += 1;
         }
     } else {
-        println!("\x1b[31m[ERROR]\x1b[0m libthook.so not found! Build or place in /data/data/com.termux/files/usr/lib/libthook.so");
+        println!("\x1b[31m[ERROR]\x1b[0m Could not locate libthook.so in system.");
         errors += 1;
     }
 
@@ -151,25 +455,20 @@ fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path
     let tmp_path = Path::new(resolved_tmp);
     if tmp_path.exists() {
         let test_file = tmp_path.join(".tnode_doctor_test");
-        match fs::write(&test_file, "doctor_test") {
-            Ok(_) => {
-                let _ = fs::remove_file(&test_file);
-                println!("\x1b[32m[OK]\x1b[0m Directory exists and is writable.");
-            }
-            Err(e) => {
-                println!("\x1b[31m[ERROR]\x1b[0m Directory exists but is NOT writable: {}", e);
-                errors += 1;
-            }
+        if fs::write(&test_file, "test").is_ok() {
+            let _ = fs::remove_file(test_file);
+            println!("\x1b[32m[OK]\x1b[0m Directory exists and is writable.");
+        } else {
+            println!("\x1b[31m[ERROR]\x1b[0m Directory exists but is NOT writable.");
+            errors += 1;
         }
     } else {
-        match fs::create_dir_all(tmp_path) {
-            Ok(_) => {
-                println!("\x1b[32m[OK]\x1b[0m Created successfully.");
-            }
-            Err(e) => {
-                println!("\x1b[31m[ERROR]\x1b[0m Does not exist and failed to create: {}", e);
-                errors += 1;
-            }
+        println!("\x1b[33m[WARN]\x1b[0m Directory does not exist. Attempting creation: ");
+        if fs::create_dir_all(tmp_path).is_ok() {
+            println!("\x1b[32m[OK]\x1b[0m Created successfully.");
+        } else {
+            println!("\x1b[31m[ERROR]\x1b[0m Failed to create directory.");
+            errors += 1;
         }
     }
 
@@ -179,7 +478,7 @@ fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path
         if p.exists() {
             println!("\x1b[32m[OK]\x1b[0m Found at {}", p.display());
         } else {
-            println!("\x1b[33m[INFO]\x1b[0m No bridge.toml in current directory (using defaults).");
+            println!("\x1b[33m[INFO]\x1b[0m File not present at {}", p.display());
         }
     } else {
         println!("\x1b[33m[INFO]\x1b[0m No bridge.toml in current directory.");
@@ -189,17 +488,18 @@ fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path
     println!("\n\x1b[36mChecking essential tools in PATH:\x1b[0m");
     let tools = ["node", "npm", "clang", "python", "bun", "git"];
     for tool in &tools {
-        match Command::new("which").arg(tool).output() {
-            Ok(out) if out.status.success() => {
-                let loc = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                println!("  - {:<8} : \x1b[32mFOUND\x1b[0m ({})", tool, loc);
+        print!("  tool {:<8}: ", tool);
+        let status = Command::new("which").arg(tool).output();
+        if let Ok(out) = status {
+            if out.status.success() {
+                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                println!("\x1b[32m[FOUND]\x1b[0m at {}", p);
+            } else {
+                println!("\x1b[33m[NOT FOUND]\x1b[0m");
+                warnings += 1;
             }
-            _ => {
-                println!("  - {:<8} : \x1b[33mNOT FOUND\x1b[0m", tool);
-                if *tool == "node" {
-                    warnings += 1;
-                }
-            }
+        } else {
+            println!("\x1b[33m[CHECK FAILED]\x1b[0m");
         }
     }
 
@@ -207,51 +507,35 @@ fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path
     println!("\n\x1b[36mChecking Current Working Directory:\x1b[0m");
     if let Ok(cwd) = env::current_dir() {
         let cwd_str = cwd.to_string_lossy();
-        print!("  Location: {} ", cwd_str);
-        if cwd_str.starts_with("/sdcard") || cwd_str.starts_with("/storage") {
-            println!("\x1b[33m(SDCARD FUSE filesystem - POSIX Shim active)\x1b[0m");
+        print!("  CWD: {} ", cwd_str);
+        if cwd_str.contains("/storage/") || cwd_str.contains("/sdcard/") {
+            println!("\x1b[33m[SDCARD/FUSE Mount Detected]\x1b[0m");
+            println!("  -> libthook.so interception active for this session.");
         } else {
-            println!("\x1b[32m(Internal storage)\x1b[0m");
+            println!("\x1b[32m[Internal Termux Filesystem]\x1b[0m");
         }
     }
 
-    println!("\n\x1b[35m=== Doctor Summary ===\x1b[0m");
-    if errors == 0 {
-        if warnings > 0 {
-            println!("\x1b[33mStatus: Passed with {} warning(s).\x1b[0m", warnings);
-        } else {
-            println!("\x1b[32mStatus: All critical checks passed! TNode is ready to use.\x1b[0m");
-        }
-        exit(0);
-    } else {
-        println!("\x1b[31mStatus: Found {} critical error(s). Please review above issues.\x1b[0m", errors);
+    println!("\nDiagnostics complete: {} error(s), {} warning(s).", errors, warnings);
+    if errors > 0 {
         exit(1);
     }
 }
 
 /// Returns the absolute form of `path`, joining to CWD if relative.
-/// Falls back to returning the original string if `current_dir()` fails.
 fn absolute_path(path: &str) -> String {
     let p = Path::new(path);
     if p.is_absolute() {
         path.to_string()
     } else {
-        match std::env::current_dir() {
+        match env::current_dir() {
             Ok(cwd) => cwd.join(p).to_string_lossy().into_owned(),
             Err(_) => path.to_string(),
         }
     }
 }
 
-/// Searches for `libthook.so` in the following locations, in priority order:
-///
-/// 1. `$THOOK_LIB_PATH` environment variable (explicit override).
-/// 2. `<exe_dir>/../lib/libthook.so` (global install layout: `bin/tnode`, `lib/libthook.so`).
-/// 3. `<exe_dir>/libthook.so` (same-directory layout).
-/// 4. `<exe_dir>/../../target/debug/libthook.so` (Cargo debug build).
-/// 5. `<exe_dir>/../../target/release/libthook.so` (Cargo release build).
-///
-/// Returns `None` if none of the candidates exist.
+/// Searches for `libthook.so` in system paths.
 fn find_thook_lib() -> Option<PathBuf> {
     if let Ok(p) = env::var("THOOK_LIB_PATH") {
         let path = PathBuf::from(p);
@@ -259,134 +543,106 @@ fn find_thook_lib() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(dir) = exe_path.parent() {
-            if let Some(parent_dir) = dir.parent() {
-                let system_candidate = parent_dir.join("lib").join("libthook.so");
-                if system_candidate.exists() { return Some(system_candidate); }
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let lib_dir = parent.join("../lib/libthook.so");
+            if lib_dir.exists() {
+                return Some(lib_dir);
             }
-            let candidate = dir.join("libthook.so");
-            if candidate.exists() { return Some(candidate); }
-            let lib_name = if cfg!(target_os = "macos") { "libthook.dylib" } else { "libthook.so" };
-            let debug_candidate = dir.join("../../target/debug").join(lib_name);
-            if debug_candidate.exists() { return Some(debug_candidate); }
-            let release_candidate = dir.join("../../target/release").join(lib_name);
-            if release_candidate.exists() { return Some(release_candidate); }
+            let same_dir = parent.join("libthook.so");
+            if same_dir.exists() {
+                return Some(same_dir);
+            }
+            let cargo_debug = parent.join("../../target/debug/libthook.so");
+            if cargo_debug.exists() {
+                return Some(cargo_debug);
+            }
+            let cargo_release = parent.join("../../target/release/libthook.so");
+            if cargo_release.exists() {
+                return Some(cargo_release);
+            }
         }
     }
     None
 }
 
 /// Removes cached ELF and shared library files older than 24 hours from `tmp_dir`.
-///
-/// Only files whose names start with `tnode_exec_`, `thook_dl_`, or `thook_exec_`
-/// are considered. Files younger than the TTL are skipped and reported as active.
 fn handle_clean(tmp_dir: &str) {
     let path = Path::new(tmp_dir);
     if !path.exists() {
-        log_info!("TMP directory '{}' does not exist. Nothing to clean.", tmp_dir);
+        log_info!("TMPDIR directory '{}' does not exist. Nothing to clean.", tmp_dir);
         return;
     }
-    let mut deleted = 0;
-    let mut skipped = 0;
+
+    let read_dir = match fs::read_dir(path) {
+        Ok(d) => d,
+        Err(e) => {
+            log_err!("Failed to read directory '{}': {}", tmp_dir, e);
+            return;
+        }
+    };
+
     let now = std::time::SystemTime::now();
-    let ttl = std::time::Duration::from_secs(24 * 60 * 60);
-    
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let filename = entry.file_name().to_string_lossy().to_string();
-            if filename.starts_with("tnode_exec_") || filename.starts_with("thook_dl_") || filename.starts_with("thook_exec_") {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        if let Ok(age) = now.duration_since(modified) {
-                            if age > ttl {
-                                if fs::remove_file(entry.path()).is_ok() {
-                                    log_info!("Deleted cached file (age: >24h): {}", filename);
-                                    deleted += 1;
-                                }
-                            } else {
-                                skipped += 1;
+    let ttl = std::time::Duration::from_secs(86400); // 24 hours
+    let mut cleaned_count = 0;
+    let mut skipped_count = 0;
+
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("tnode_exec_") || name.starts_with("thook_dl_") || name.starts_with("thook_exec_") {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(age) = now.duration_since(modified) {
+                        if age > ttl {
+                            if fs::remove_file(entry.path()).is_ok() {
+                                cleaned_count += 1;
+                                log_info!("Cleaned expired cache file: {}", name);
                             }
+                        } else {
+                            skipped_count += 1;
                         }
                     }
                 }
             }
         }
     }
-    if deleted > 0 {
-        log_info!("Cleanup complete. {} cached files removed ({} still active).", deleted, skipped);
-    } else if skipped > 0 {
-        log_info!("No old cached files found ({} files are younger than 24h).", skipped);
-    } else {
-        log_info!("No cached files found to clean in '{}'.", tmp_dir);
-    }
+
+    log_info!("Garbage Collection complete: {} file(s) cleaned, {} file(s) active.", cleaned_count, skipped_count);
 }
 
 /// Writes a default `bridge.toml` to `config_path` if it does not already exist.
-///
-/// The template is populated with:
-/// - `$TMPDIR` from the environment (falls back to the Termux default).
-/// - The path of `node` as resolved by `which`.
-/// - A hardcoded default `libthook.so` path.
-///
-/// The function is a no-op if `config_path` already exists so it can be called
-/// unconditionally on startup without overwriting user edits.
 fn generate_default_config(config_path: &Path) {
     if config_path.exists() {
         return;
     }
+
     let default_tmp = env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string());
-    let node_path = match Command::new("which").arg("node").output() {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    
+    let default_node_path = match Command::new("which").arg("node").output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => "/data/data/com.termux/files/usr/bin/node".to_string(),
     };
-    let default_lib = "/data/data/com.termux/files/usr/lib/libthook.so";
 
-    let template = format!(r#"# TNode Bridge Configuration File
-# Auto-generated by tnode on first run.
-
+    let content = format!(r#"# bridge.toml — TNode project-level configuration
 [core]
-# Master switch for the Bridge configurations.
-# Set to false to disable aliases and args injection for this configuration scope.
 enabled = true
-
-# Global configurations for TNode operations.
 tmp = "{}"
-lib = "{}"
-
-# Optional: Define a file to dump debug logs. 
-# You can use {{timestamp}} and {{pid}} macros to separate logs per run.
+lib = "/data/data/com.termux/files/usr/lib/libthook.so"
 # log = "thook-{{timestamp}}.log"
-
-# Debug levels: "off", "error", "warn", "info", "trace"
-# "error": Only critical failures
-# "warn": Informational warnings and non-standard behavior
-# "info": Basic lifecycle and main interceptions
-# "trace": Massive mode (state of variables, all resolved paths and deep syscall logs)
 debug_level = "off"
 
 [aliases]
-# Short aliases mapping to absolute executable paths.
-# Example:
-# python3 = "/data/data/com.termux/files/usr/bin/python3"
 node = "{}"
 
 [args]
-# Arguments automatically injected BEFORE user arguments for specific aliases/commands.
-# Example:
-# npm = ["--ignore-scripts", "--verbose"]
+# npm = ["--ignore-scripts"]
 
 [env]
-# Environment variables automatically injected into the process.
-# This works exactly like a .env file but is processed natively by tnode.
-# Example:
 # PRISMA_QUERY_ENGINE_LIBRARY = "/path/to/libquery_engine.so.node"
-"#, default_tmp, default_lib, node_path);
+"#, default_tmp, default_node_path);
 
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent).unwrap_or_default();
-    }
-    if fs::write(config_path, template).is_ok() {
+    if fs::write(config_path, content).is_ok() {
         log_info!("Generated default bridge.toml at {}", config_path.display());
     }
 }
@@ -409,6 +665,9 @@ fn main() {
     let mut show_env_export = false;
     let mut run_doctor = false;
     let mut should_init = false;
+    let mut show_changelog = false;
+    let mut changelog_target = None;
+    let mut run_update = false;
     
     while let Some(arg) = iter.next() {
         if arg.starts_with("--tnode-") {
@@ -430,6 +689,19 @@ fn main() {
                 "--tnode-env-export" => show_env_export = true,
                 "--tnode-doctor" => run_doctor = true,
                 "--tnode-init" => should_init = true,
+                "--tnode-update" => run_update = true,
+                "--tnode-changelog" => {
+                    show_changelog = true;
+                    if let Some(val) = iter.next() {
+                        if !val.starts_with("--tnode-") && (val.starts_with('v') || val.chars().next().map_or(false, |c| c.is_ascii_digit())) {
+                            changelog_target = Some(val);
+                        } else {
+                            target_command = Some(val);
+                            target_args.extend(iter);
+                            break;
+                        }
+                    }
+                }
                 "--tnode-debug" => {
                     let next_val = match iter.next() {
                         Some(val) if !val.starts_with("--tnode-") => val,
@@ -467,6 +739,16 @@ fn main() {
         }
     }
 
+    if show_changelog {
+        print_changelog(changelog_target.as_deref());
+        exit(0);
+    }
+
+    if run_update {
+        handle_update();
+        exit(0);
+    }
+
     let local_config_path = PathBuf::from("./bridge.toml");
 
     if should_init {
@@ -481,137 +763,122 @@ fn main() {
         None
     };
 
-    if let Some(path) = config_path_to_load.as_ref() {
-        if let Ok(contents) = fs::read_to_string(path) {
-            match toml::from_str::<BridgeConfig>(&contents) {
-                Ok(parsed) => {
-                    config = parsed;
-                }
+    if let Some(ref path) = config_path_to_load {
+        if let Ok(content) = fs::read_to_string(path) {
+            match toml::from_str::<BridgeConfig>(&content) {
+                Ok(parsed) => config = parsed,
                 Err(e) => {
-                    if !show_env_export {
-                        log_warn!("Invalid bridge.toml syntax in {}, ignoring config: {}", path.display(), e);
-                    }
+                    log_warn!("Failed to parse bridge.toml at {}: {}", path.display(), e);
                 }
             }
         }
     }
 
-    let is_enabled = if bridge_off {
-        false
+    if bridge_off {
+        config.core.enabled = Some(false);
     } else if bridge_on {
-        true
-    } else {
-        config.core.enabled.unwrap_or(true)
-    };
+        config.core.enabled = Some(true);
+    }
 
-    let resolved_tmp = custom_tmp.clone().or_else(|| config.core.tmp.clone()).unwrap_or_else(|| {
-        env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string())
-    });
+    let is_enabled = config.core.enabled.unwrap_or(true);
 
-    let lib_path_opt = custom_lib.clone().or_else(|| config.core.lib.clone()).map(PathBuf::from).or_else(find_thook_lib);
+    let resolved_lib_path = custom_lib.map(PathBuf::from)
+        .or_else(|| config.core.lib.as_ref().map(PathBuf::from))
+        .or_else(find_thook_lib);
 
-    if run_doctor {
-        handle_doctor(config_path_to_load.as_ref(), &config, lib_path_opt.as_ref(), &resolved_tmp);
+    let resolved_tmp = custom_tmp
+        .or(config.core.tmp.clone())
+        .unwrap_or_else(|| {
+            env::var("THOOK_TMPDIR")
+                .unwrap_or_else(|_| env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string()))
+        });
+
+    if should_clean {
+        handle_clean(&resolved_tmp);
         exit(0);
     }
 
-    let debug_val = inject_debug.clone().or_else(|| config.core.debug_level.clone()).unwrap_or_else(|| "off".to_string());
-
-    if show_env_export {
-        let final_lib_path = lib_path_opt.unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/usr/lib/libthook.so"));
-        println!("export LD_PRELOAD=\"{}\"", final_lib_path.display());
-        println!("export THOOK_TMPDIR=\"{}\"", resolved_tmp);
-        if debug_val != "off" {
-            println!("export THOOK_DEBUG_LEVEL=\"{}\"", debug_val);
-        }
-        if is_enabled {
-            for (k, v) in &config.env {
-                let val_str = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
-                let escaped_val = val_str.replace('\\', "\\\\").replace('"', "\\\"");
-                println!("export {}=\"{}\"", k, escaped_val);
-            }
-        }
+    if run_doctor {
+        handle_doctor(config_path_to_load.as_ref(), &config, resolved_lib_path.as_ref(), &resolved_tmp);
         exit(0);
     }
 
     if show_env {
-        println!("\x1b[35m=== TNode Active Environment ===\x1b[0m");
-        println!("\x1b[36mLoaded Config File:\x1b[0m {:?}", config_path_to_load);
-        println!("\x1b[36mBridge Features Enabled:\x1b[0m {}", is_enabled);
-        println!("\x1b[36mCore Settings:\x1b[0m");
-        println!("  - Tmp: {:?}", custom_tmp.as_ref().or(config.core.tmp.as_ref()));
-        println!("  - Lib: {:?}", custom_lib.as_ref().or(config.core.lib.as_ref()));
-        println!("  - Log: {:?}", log_file.as_ref().or(config.core.log.as_ref()));
-        println!("  - Debug Level: {:?}", inject_debug.as_ref().or(config.core.debug_level.as_ref()));
-        
-        if is_enabled {
-            println!("\x1b[36mAliases:\x1b[0m");
-            for (k, v) in &config.aliases {
-                println!("  - {} -> {}", k, v);
-            }
-            println!("\x1b[36mInjected Args:\x1b[0m");
-            for (k, v) in &config.args {
-                println!("  - {} -> {:?}", k, v);
-            }
-            println!("\x1b[36mInjected Env Vars:\x1b[0m");
-            for (k, v) in &config.env {
-                let val_str = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
-                println!("  - {} = {:?}", k, val_str);
-            }
+        println!("=== TNode Bridge Active Configuration ===");
+        println!("Core Enabled     : {}", is_enabled);
+        println!("Resolved Lib     : {}", resolved_lib_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "NOT FOUND".to_string()));
+        println!("Resolved TmpDir  : {}", resolved_tmp);
+        println!("Debug Level      : {}", inject_debug.as_ref().or(config.core.debug_level.as_ref()).unwrap_or(&"off".to_string()));
+        println!("Log File         : {}", log_file.as_ref().or(config.core.log.as_ref()).unwrap_or(&"stderr".to_string()));
+        println!("\n[Aliases]");
+        for (k, v) in &config.aliases {
+            println!("  {:<12} -> {}", k, v);
         }
-
-        println!("\n\x1b[35m=== System Environment Variables ===\x1b[0m");
-        for (k, v) in env::vars() {
-            println!("  - \x1b[36m{}\x1b[0m = {:?}", k, v);
+        println!("\n[Prepended Args]");
+        for (k, v) in &config.args {
+            println!("  {:<12} -> {:?}", k, v);
+        }
+        println!("\n[Injected Env]");
+        for (k, v) in &config.env {
+            println!("  {:<12} = {}", k, v);
         }
         exit(0);
     }
 
-    if should_clean {
-        handle_clean(&resolved_tmp);
-        if target_command.is_none() { exit(0); }
-    }
-
-    let mut final_bin = match target_command {
-        Some(cmd) => cmd,
+    let lib_path = match resolved_lib_path {
+        Some(path) => path,
         None => {
-            log_err!("No target command specified. Try --tnode-help.");
+            log_err!("Could not locate libthook.so. Make sure it is installed or set THOOK_LIB_PATH.");
             exit(1);
-        },
+        }
     };
 
-    if is_enabled {
-        if let Some(alias_path) = config.aliases.get(&final_bin) {
-            final_bin = alias_path.clone();
+    if show_env_export {
+        println!("export LD_PRELOAD=\"{}\"", lib_path.display());
+        println!("export THOOK_TMPDIR=\"{}\"", resolved_tmp);
+        if let Some(ref dbg) = inject_debug.or(config.core.debug_level) {
+            println!("export THOOK_DEBUG_LEVEL=\"{}\"", dbg);
         }
-        let bin_name = Path::new(&final_bin).file_name().unwrap_or_default().to_string_lossy().to_string();
-        if let Some(injected_args) = config.args.get(&bin_name) {
-            let mut new_args = injected_args.clone();
-            new_args.extend(target_args);
-            target_args = new_args;
+        if let Some(ref log) = log_file.or(config.core.log) {
+            println!("export THOOK_LOG_FILE=\"{}\"", log);
         }
+        for (k, v) in &config.env {
+            let val_str = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+            println!("export {}=\"{}\"", k, val_str);
+        }
+        exit(0);
     }
 
-    let lib_path = match custom_lib.or(config.core.lib) {
-        Some(p) => {
-            let path = PathBuf::from(p);
-            if !path.exists() {
-                log_err!("Custom lib path does not exist: {:?}", path);
-                exit(1);
-            }
-            path
-        }
-        None => match find_thook_lib() {
-            Some(p) => p,
-            None => {
-                log_err!("Could not find libthook.so automatically. Try passing --tnode-lib <path>.");
-                exit(1);
-            }
+    let (raw_bin, user_args) = match target_command {
+        Some(bin) => (bin, target_args),
+        None => {
+            print_help();
+            exit(0);
         }
     };
+
+    let bin = if is_enabled {
+        config.aliases.get(&raw_bin).cloned().unwrap_or(raw_bin)
+    } else {
+        raw_bin
+    };
+
+    let mut final_args = Vec::new();
+    if is_enabled {
+        if let Some(extra_args) = config.args.get(&bin) {
+            final_args.extend(extra_args.clone());
+        }
+    }
+    final_args.extend(user_args);
 
     let debug_val = inject_debug.or(config.core.debug_level).unwrap_or_else(|| "off".to_string());
     let log_val = log_file.or(config.core.log);
+
+    // Show changelog on first execution of new version
+    check_and_show_new_changelog();
+
+    // Check updates in background thread (cached 1x/24h)
+    check_updates_background();
 
     let attempt_execution = |bin: &str, args: &[String]| -> std::io::Result<std::process::ExitStatus> {
         let mut cmd = Command::new(bin);
@@ -624,63 +891,54 @@ fn main() {
         }
         
         let b = bin.to_string();
-        // Node-Gyp requires ANDROID_NDK_PATH to be set to a non-empty value.
-        // Using the npm_config_ prefix causes npm to emit an "Unknown env config" warning.
-        // ANDROID_NDK_PATH is read directly by node-gyp's OS/JS evaluation layer.
         if b.contains("npm") || b.contains("npx") || b.contains("yarn") || b.contains("pnpm") || b.contains("node-gyp") {
             cmd.env("npm_config_android_ndk_path", "dummy");
         }
-        
-        if debug_val != "off" {
-            cmd.env("THOOK_DEBUG_LEVEL", &debug_val);
-        }
-        if let Some(ref log) = log_val {
-            let mut final_log = log.clone();
-            if final_log.contains("{timestamp}") {
-                if let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                    final_log = final_log.replace("{timestamp}", &duration.as_secs().to_string());
-                }
-            }
-            if final_log.contains("{pid}") {
-                final_log = final_log.replace("{pid}", &std::process::id().to_string());
-            }
-            cmd.env("THOOK_LOG_FILE", absolute_path(&final_log));
-        }
+
         cmd.env("THOOK_TMPDIR", &resolved_tmp);
+        cmd.env("THOOK_DEBUG_LEVEL", &debug_val);
+        
+        if let Some(ref log_path) = log_val {
+            let expanded_log = log_path
+                .replace("{timestamp}", &std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs().to_string()).unwrap_or_default())
+                .replace("{pid}", &std::process::id().to_string());
+            cmd.env("THOOK_LOG_FILE", expanded_log);
+        }
         
         cmd.status()
     };
 
-    match attempt_execution(&final_bin, &target_args) {
-        Ok(status) => exit(status.code().unwrap_or(1)),
+    match attempt_execution(&bin, &final_args) {
+        Ok(status) => {
+            print_pending_update_notice();
+            exit(status.code().unwrap_or(0));
+        }
         Err(e) => {
-            if e.raw_os_error() == Some(13) {
-                if let Some(shebang_args) = get_shebang(&final_bin) {
-                    let interpreter = &shebang_args[0];
-                    let mut new_args = Vec::new();
-                    for arg in shebang_args.iter().skip(1) { new_args.push(arg.clone()); }
-                    new_args.push(final_bin.clone());
-                    new_args.extend_from_slice(&target_args);
-                    match attempt_execution(interpreter, &new_args) {
-                        Ok(status) => exit(status.code().unwrap_or(1)),
-                        Err(e2) => {
-                            log_err!("Failed to execute shebang wrapper: {}", e2);
-                            exit(1);
-                        }
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                log_warn!("EACCES executing '{}'. Attempting fallback execution...", bin);
+                
+                if let Some(shebang_args) = get_shebang(&bin) {
+                    let mut fallback_args = shebang_args;
+                    fallback_args.push(bin.clone());
+                    fallback_args.extend(final_args.clone());
+                    let interp = fallback_args.remove(0);
+                    
+                    if let Ok(st) = attempt_execution(&interp, &fallback_args) {
+                        print_pending_update_notice();
+                        exit(st.code().unwrap_or(0));
                     }
-                } else if is_elf(&final_bin) {
-                    if let Some(copied_path) = copy_elf_to_tmp(&final_bin, &resolved_tmp) {
-                        match attempt_execution(&copied_path, &target_args) {
-                            Ok(status) => exit(status.code().unwrap_or(1)),
-                            Err(e2) => {
-                                log_err!("Failed to execute copied ELF: {}", e2);
-                                exit(1);
-                            }
+                } else if is_elf(&bin) {
+                    if let Some(copied) = copy_elf_to_tmp(&bin, &resolved_tmp) {
+                        if let Ok(st) = attempt_execution(&copied, &final_args) {
+                            print_pending_update_notice();
+                            exit(st.code().unwrap_or(0));
                         }
                     }
                 }
             }
-            log_err!("Failed to execute {}: {}", final_bin, e);
+            
+            log_err!("Failed to execute '{}': {}", bin, e);
+            print_pending_update_notice();
             exit(1);
         }
     }
@@ -688,32 +946,30 @@ fn main() {
 
 /// Reads the shebang line from `filepath` and returns the interpreter path and
 /// any arguments embedded in the shebang line.
-///
-/// Rewriting rules (same as in `libthook`):
-/// - `/bin/sh` -> `$PREFIX/bin/sh`
-/// - `/bin/bash` -> `$PREFIX/bin/bash`
-/// - `/usr/bin/env` -> `$PREFIX/bin/env`
-///
-/// Returns `None` if the file cannot be opened, is too short, or has no shebang.
 fn get_shebang(filepath: &str) -> Option<Vec<String>> {
     use std::io::Read;
-    let mut file = match std::fs::File::open(filepath) {
+    let mut file = match fs::File::open(filepath) {
         Ok(f) => f,
         Err(_) => return None,
     };
+
     let mut buffer = [0u8; 256];
     let bytes_read = file.read(&mut buffer).unwrap_or(0);
-    if bytes_read < 2 { return None; }
+    if bytes_read < 2 {
+        return None;
+    }
+
     if buffer[0] == b'#' && buffer[1] == b'!' {
         let shebang_line = buffer.iter()
             .take(bytes_read)
             .take_while(|&&c| c != b'\n')
             .copied()
             .collect::<Vec<u8>>();
+            
         if let Ok(line) = String::from_utf8(shebang_line) {
             let mut parts: Vec<String> = line[2..].split_whitespace().map(|s| s.to_string()).collect();
             if !parts.is_empty() {
-                let prefix = std::env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
+                let prefix = env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
                 if parts[0] == "/bin/sh" || parts[0] == "/bin/bash" {
                     parts[0] = format!("{}/bin/{}", prefix, if parts[0] == "/bin/sh" { "sh" } else { "bash" });
                 } else if parts[0] == "/usr/bin/env" {
@@ -730,7 +986,7 @@ fn get_shebang(filepath: &str) -> Option<Vec<String>> {
 /// number `\x7fELF`. Used to distinguish native binaries from scripts.
 fn is_elf(filepath: &str) -> bool {
     use std::io::Read;
-    let mut file = match std::fs::File::open(filepath) {
+    let mut file = match fs::File::open(filepath) {
         Ok(f) => f,
         Err(_) => return false,
     };
@@ -742,15 +998,11 @@ fn is_elf(filepath: &str) -> bool {
 }
 
 /// Copies an ELF binary from the SDCARD to `tmp_dir` and returns the cached path.
-///
-/// The filename includes a hash derived from the absolute source path, the
-/// modification time, and the file size for cache invalidation. The copy is
-/// made executable. Returns `None` on any I/O failure.
 fn copy_elf_to_tmp(filepath: &str, tmp_dir: &str) -> Option<String> {
     let path = Path::new(filepath);
-    let metadata = std::fs::metadata(path).ok()?;
-    let absolute_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    std::fs::create_dir_all(tmp_dir).unwrap_or_default();
+    let metadata = fs::metadata(path).ok()?;
+    let absolute_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    fs::create_dir_all(tmp_dir).unwrap_or_default();
     
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -771,11 +1023,11 @@ fn copy_elf_to_tmp(filepath: &str, tmp_dir: &str) -> Option<String> {
     let new_path = Path::new(&new_path_str);
     
     if !new_path.exists() {
-        if std::fs::copy(filepath, &new_path_str).is_ok() {
+        if fs::copy(filepath, &new_path_str).is_ok() {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(mut perms) = std::fs::metadata(&new_path_str).map(|m| m.permissions()) {
+            if let Ok(mut perms) = fs::metadata(&new_path_str).map(|m| m.permissions()) {
                 perms.set_mode(0o700);
-                let _ = std::fs::set_permissions(&new_path_str, perms);
+                let _ = fs::set_permissions(&new_path_str, perms);
                 return Some(new_path_str);
             }
         }
@@ -783,3 +1035,4 @@ fn copy_elf_to_tmp(filepath: &str, tmp_dir: &str) -> Option<String> {
     }
     Some(new_path_str)
 }
+
