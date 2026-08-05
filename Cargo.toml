@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/thook",
+    "crates/tnode"
+]
+resolver = "2"
+
+[profile.release]
+strip = true      # Remove symbols (reduces size drastically)
+opt-level = "z"   # Optimize for size
+lto = true        # Link-time optimization
+codegen-units = 1 # Better optimization, slower compilation
+panic = "abort"   # Remove panic unwinding overhead

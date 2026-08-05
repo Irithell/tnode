@@ -1,0 +1,32 @@
+{
+    global:
+        realpath;
+        symlink;
+        symlinkat;
+        readlink;
+        readlinkat;
+        chmod;
+        fchmodat;
+        flock;
+        fcntl;
+        syscall;
+        execve;
+        execvp;
+        dlopen;
+        mkfifo;
+        mkfifoat;
+        link;
+        linkat;
+        open;
+        open64;
+        openat;
+        openat64;
+        stat;
+        lstat;
+        stat64;
+        lstat64;
+        unlink;
+        unlinkat;
+    local:
+        *;
+};
