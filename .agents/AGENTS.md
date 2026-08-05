@@ -301,6 +301,65 @@ Runs a checklist and exits with 0 on success or 1 on critical failures.
 Deletes `thook_exec_*`, `thook_dl_*`, and `tnode_exec_*` files in `$TMPDIR`
 that are older than 24 hours.
 
+### `--tnode-update`
+
+Downloads and installs the latest release from `https://github.com/Irithell/tnode/releases`.
+
+Flow:
+1. Calls the GitHub Releases API via `curl` and extracts `tag_name` from the JSON response.
+2. Detects the running architecture (`env::consts::ARCH`) and platform (checks for `/data/data/com.termux`).
+3. Downloads the matching binary asset (`tnode-<arch>-<platform>`) and library asset (`libthook-<arch>-<platform>.so`) to a temporary staging directory (`$TMPDIR/tnode_update_download/`).
+4. Replaces the current binary and library atomically via `fs::copy` + `fs::rename` to avoid a partially-written state.
+5. Sets `chmod 0755` on the installed binary via `PermissionsExt`.
+6. Displays the changelog panel for the new version immediately after completion via `print_changelog(Some(&latest_ver))`.
+
+Do not verify checksums inside the Rust binary; checksum verification is the responsibility of `install.sh`.
+
+### `--tnode-changelog [version|latest|all]`
+
+Renders the embedded `CHANGELOG.md` (included at compile time via `include_str!("../../../CHANGELOG.md")`) as a terminal panel with colored status indicators:
+- `\x1b[32m●\x1b[0m` — Added (green)
+- `\x1b[34m●\x1b[0m` — Changed (blue)
+- `\x1b[31m●\x1b[0m` — Removed (red)
+
+Accepted arguments:
+- No argument or `latest`: renders only the first (most recent) version block.
+- `all`: renders the full history.
+- A specific version string (`0.1.1` or `v0.1.1`): renders that version block only.
+
+The CHANGELOG parser is line-based. It identifies version blocks by lines starting with `## [`, and section headings by lines starting with `### `. The `print_changelog` function must never make network calls; it reads only from the compile-time embedded constant.
+
+### Background update check
+
+On every normal command execution, `check_updates_background()` is called before launching the child process:
+1. Reads `~/.cache/tnode/last_check` (a Unix timestamp in seconds).
+2. If more than 86400 seconds have elapsed, spawns a detached `std::thread` that calls `fetch_latest_release_tag()` via `curl`.
+3. The thread writes the retrieved tag to `~/.cache/tnode/latest_version` and the current timestamp to `~/.cache/tnode/last_check`.
+4. After the child exits, `print_pending_update_notice()` reads `~/.cache/tnode/latest_version`. If the cached tag differs from `VERSION`, a one-line notice is printed to stderr.
+
+The background thread must never block the main execution path. It is fire-and-forget.
+
+### Path validation (`is_suitable_tmp_dir`)
+
+`is_suitable_tmp_dir(path: &str) -> bool` is called before accepting any custom temporary directory (from `--tnode-tmp`, `bridge.toml [core] tmp`, or `$THOOK_TMPDIR`).
+
+Returns `false` if:
+- The path contains `/storage/` or `/sdcard/` (FUSE noexec mount).
+- `fs::create_dir_all` fails.
+- A write probe (`fs::write` + `fs::remove_file` on `.tnode_writable_test`) fails.
+
+On failure, `tnode` emits a `[tnode:WARN]` message and falls back to `$TMPDIR` (or the Termux internal tmp hardcoded path if that also fails). This fallback chain must never silently proceed with an invalid tmp directory.
+
+The equivalent guard in `libthook` is `get_valid_tmp_dir()`, which rejects paths containing `/storage/` or `/sdcard/` at the pattern level (without a write probe, since `libthook` runs in an injected context where stdio and filesystem probes would be re-entrant risks).
+
+### Configured `lib` path validation
+
+When a custom `libthook.so` path is provided (via `--tnode-lib` or `bridge.toml [core] lib`), `tnode` checks that `path.exists() && path.is_file()` before using it. If the check fails, a `[tnode:WARN]` is emitted and the auto-discovery fallback (`find_thook_lib()`) is used instead. Discovery order:
+1. `$THOOK_LIB_PATH`
+2. `<exe>/../lib/libthook.so`
+3. Same directory as the `tnode` binary
+4. Cargo debug/release target paths (development only)
+
 ### NDK injection (`npm_config_android_ndk_path`)
 
 For processes whose name contains `npm`, `npx`, `yarn`, `pnpm`, or
@@ -471,3 +530,13 @@ following table summarizes expected behavior per runtime:
 10. **Debug level variable**: use `THOOK_DEBUG_LEVEL` with string values
     (`error`/`warn`/`info`/`trace`). The legacy `THOOK_DEBUG=1` is still
     accepted for backwards compatibility but not preferred.
+
+11. **`print_changelog` must not make network calls.** The function renders only the compile-time embedded `CHANGELOG` constant. Never add HTTP requests to it.
+
+12. **Background update thread is fire-and-forget.** `check_updates_background()` must not be awaited, joined, or allowed to delay the main execution path in any way.
+
+13. **`is_suitable_tmp_dir` must be called before accepting any custom tmp path.** Never pass a user-supplied or environment-supplied tmp path directly to ELF Copier, FIFO, or dlopen cache operations without first validating writability and confirming the path is not on an SDCARD FUSE mount.
+
+14. **`get_valid_tmp_dir` in `libthook` is a pattern-only guard.** It checks for `/storage/` or `/sdcard/` in the path string. Do not add write probes or filesystem calls inside it; `libthook` runs injected into arbitrary processes where blocking I/O in hook context is unsafe.
+
+15. **Changelog is embedded, not loaded at runtime.** `CHANGELOG` is included via `include_str!("../../../CHANGELOG.md")` at compile time. If the changelog is modified after building, the binary must be recompiled for the change to be reflected.

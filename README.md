@@ -1,5 +1,11 @@
 # tnode / thook
 
+[![Latest Release](https://img.shields.io/github/v/release/Irithell/tnode?label=release&color=4a90e2)](https://github.com/Irithell/tnode/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Termux-brightgreen)](https://github.com/Irithell/tnode)
+[![Architecture](https://img.shields.io/badge/arch-aarch64%20%7C%20x86__64-orange)](https://github.com/Irithell/tnode/releases/latest)
+[![License](https://img.shields.io/github/license/Irithell/tnode)](LICENSE)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-b7410e)](https://www.rust-lang.org)
+
 A POSIX compatibility shim and Node.js bridge for Android Termux.
 
 `libthook.so` is injected into any process via `LD_PRELOAD` and intercepts
@@ -7,6 +13,38 @@ libc calls (`realpath`, `execve`, `dlopen`, `flock`, `fcntl`, `symlink`,
 `mkfifo`, `link`, and others) to transparently paper over Android's SDCARD
 filesystem restrictions. `tnode` is the CLI wrapper that configures the
 environment and launches any command with the library pre-loaded.
+
+---
+
+## Table of contents
+
+- [How it works](#how-it-works)
+  - [ELF Copier bypass](#elf-copier-bypass)
+  - [Shebang bypass](#shebang-bypass-termux-exec-emulation)
+  - [FIFO redirection](#fifo-named-pipe-redirection)
+  - [dlopen namespace bypass](#dlopen-namespace-bypass)
+  - [Realpath opaque strategy](#realpath-opaque-strategy)
+  - [Known limits](#known-limits-ld_preload-boundary)
+- [Project structure](#project-structure)
+- [Installation](#installation-recommended)
+  - [One-line installer](#one-line-installer-termux)
+  - [Manual installation](#manual-installation)
+- [Building from source](#building-from-source)
+- [Usage](#usage)
+  - [Quick start](#quick-start)
+  - [CLI flags](#cli-flags-tnode-prefixed-to-avoid-conflicts-with-wrapped-commands)
+  - [bridge.toml](#bridgetoml)
+  - [Environment export](#using-the-environment-export-eval-mode)
+  - [Diagnostics](#diagnostics)
+- [Environment variables](#environment-variables)
+- [Scope of this tool](#scope-of-this-tool)
+- [Ecosystem compatibility](#ecosystem-compatibility)
+  - [canvas](#canvas)
+  - [better-sqlite3](#better-sqlite3)
+  - [puppeteer](#puppeteer)
+  - [Prisma](#prisma)
+
+---
 
 ## How it works
 
@@ -214,6 +252,8 @@ tnode --tnode-debug trace --tnode-log ./thook-{timestamp}.log npm run build
 |---|---|
 | `--tnode-help` | Print help and exit |
 | `--tnode-version` | Print version and exit |
+| `--tnode-update` | Download and install the latest release atomically |
+| `--tnode-changelog [version\|latest\|all]` | Display the changelog panel (default: latest version) |
 | `--tnode-lib <path>` | Use a custom `libthook.so` |
 | `--tnode-tmp <path>` | Override the ELF cache directory |
 | `--tnode-log <path>` | Write hook logs to a file (`{timestamp}` and `{pid}` macros supported) |
@@ -280,3 +320,205 @@ tools in `$PATH`.
 | `THOOK_TMPDIR` | Directory for ELF cache and FIFO redirects |
 | `THOOK_LIB_PATH` | Explicit override for `libthook.so` discovery |
 | `PREFIX` | Termux prefix (default: `/data/data/com.termux/files/usr`) |
+
+## Scope of this tool
+
+`tnode` and `libthook.so` solve one specific class of problem: libc-level
+filesystem and linker restrictions imposed by Android's SDCARD FUSE mount.
+They do not install, manage, or provide any build toolchains, system
+libraries, native compilers, or external runtimes.
+
+If a native addon requires a C compiler, a system library, or a
+pre-compiled binary targeted at the Android AArch64 ABI, that dependency
+must be separately installed and made available in the environment before
+`tnode npm install` is invoked. The sections below document the exact
+requirements for commonly used packages.
+
+---
+
+## Ecosystem compatibility
+
+The following sections describe the system-level requirements for packages
+that are frequently used in Node.js projects on Termux and that need
+additional setup beyond `npm install`.
+
+### APT flags used in this section
+
+Several install commands in this section include flags that are non-default
+for standard Debian/Ubuntu APT usage. On some Android devices, the APT
+sandbox mechanism (which drops privileges before invoking the package
+manager backend) does not operate correctly because the system user namespace
+or `setuid` support is restricted at the kernel or firmware level. The flag
+`-o APT::Sandbox::User=root` instructs APT to skip the privilege drop and
+run the backend directly under the current user, which is root within the
+Termux environment. The flag `--allow-unauthenticated` suppresses signature
+verification errors that can occur when pulling packages from community
+repositories (`tur-repo`, `x11-repo`) that may not have their signing keys
+fully registered in the local keyring at install time. These flags should
+be used only within Termux; they are not appropriate for general Debian
+system administration.
+
+---
+
+### canvas
+
+The `canvas` package requires GTK and Cairo development headers plus several
+image format libraries to compile its native C++ addon at install time.
+
+**System dependencies:**
+
+```sh
+pkg install x11-repo tur-repo -y -o APT::Sandbox::User=root
+pkg update -y -o APT::Sandbox::User=root
+pkg install \
+  build-essential clang make python pkg-config \
+  pango libcairo libpng libjpeg-turbo giflib librsvg \
+  xorgproto libx11 libxrender \
+  -y -o APT::Sandbox::User=root --allow-unauthenticated
+```
+
+To install only the packages that are not already present, query the package
+manager first and pass only the missing ones to `pkg install`. The following
+shell snippet demonstrates the pattern:
+
+```sh
+PKGS="build-essential clang make python pkg-config pango libcairo libpng libjpeg-turbo giflib librsvg xorgproto libx11 libxrender"
+
+MISSING=$(for p in $PKGS; do
+  dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || echo "$p"
+done)
+
+if [ -n "$MISSING" ]; then
+  pkg install $MISSING -y -o APT::Sandbox::User=root --allow-unauthenticated
+fi
+```
+
+**Install canvas:**
+
+```sh
+tnode npm install canvas
+```
+
+---
+
+### better-sqlite3
+
+`better-sqlite3` compiles a native addon that links against the SQLite
+amalgamation. The system SQLite headers and build tools must be present.
+
+**System dependencies:**
+
+```sh
+pkg update -y -o APT::Sandbox::User=root
+pkg install \
+  build-essential clang make python pkg-config sqlite \
+  -y -o APT::Sandbox::User=root --allow-unauthenticated
+```
+
+**Install better-sqlite3:**
+
+```sh
+tnode npm install better-sqlite3
+```
+
+---
+
+### puppeteer
+
+Puppeteer requires a Chromium binary targeted at the Android AArch64 ABI.
+The upstream Chromium distributed through npm (`chromium` bundled by
+puppeteer's postinstall script) is compiled for Linux x86_64 and cannot
+execute on Android. Install the Termux-provided Chromium package instead
+and configure puppeteer to use it.
+
+**System dependencies:**
+
+```sh
+pkg upgrade -y && pkg install x11-repo tur-repo -y && pkg update -y
+pkg install chromium -y
+```
+
+**Configuring puppeteer to use the system Chromium:**
+
+Puppeteer must be told to skip its own Chromium download and to use the
+system binary. At a minimum, `executablePath` must point to the installed
+binary and the flags `--no-sandbox`, `--disable-setuid-sandbox`, and
+`--disable-dev-shm-usage` must be passed because the Android kernel
+configuration does not provide the namespace isolation that Chromium's
+sandbox requires.
+
+The following is an example of how to override the launch method in a
+runtime configuration. Adapt the pattern to your application's structure
+without modifying the puppeteer package itself:
+
+```js
+const puppeteer = require("puppeteer");
+
+const browser = await puppeteer.launch({
+  executablePath: "/data/data/com.termux/files/usr/bin/chromium-browser",
+  args: [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+  ],
+});
+```
+
+**Install puppeteer (without bundled Chromium):**
+
+```sh
+PUPPETEER_SKIP_DOWNLOAD=true tnode npm install puppeteer
+```
+
+---
+
+### Prisma
+
+The official Prisma query engine binaries are compiled for glibc-based Linux
+and cannot be executed on Android Bionic. Pre-compiled engine binaries
+targeting AArch64 Android are available at:
+
+**<https://github.com/Irithell/prisma-termux/releases>**
+
+If you require a version that is not listed there, open an issue in that
+repository.
+
+**Configuring Prisma to use the local engine binaries:**
+
+Prisma must be instructed to use the binary engine type and to resolve each
+engine binary from the directory where you placed the downloaded files. If
+these variables are not set, Prisma defaults to the library engine type and
+attempts to load a glibc-compiled shared object, which will fail on Bionic.
+
+Set the following environment variables before importing the Prisma client,
+or place them in the entry point of your application before any module
+resolution occurs:
+
+```js
+const path = require("path");
+
+const enginesDir = "/path/to/your/prisma/engines";
+
+process.env.PRISMA_CLIENT_ENGINE_TYPE = "binary";
+process.env.PRISMA_QUERY_ENGINE_BINARY = path.join(enginesDir, "query-engine");
+process.env.PRISMA_SCHEMA_ENGINE_BINARY = path.join(enginesDir, "schema-engine");
+process.env.PRISMA_FMT_BINARY = path.join(enginesDir, "prisma-fmt");
+```
+
+For commands that run outside your application entry point, such as
+`npx prisma studio`, the engine type must be set explicitly in the shell
+environment because the application bootstrap code does not run in that
+context:
+
+```sh
+PRISMA_CLIENT_ENGINE_TYPE=binary tnode npx prisma studio
+```
+
+Alternatively, add it to the `[env]` block of your `bridge.toml` so that
+`tnode` injects it automatically for every command:
+
+```toml
+[env]
+PRISMA_CLIENT_ENGINE_TYPE = "binary"
+```
+

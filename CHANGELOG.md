@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.2] - 2026-08-05
+
+### Added
+- Path suitability validation for custom temporary directory (`tmp`) and library (`libthook.so`) configs
+- Automatic fallback with warning logs when configured `tmp` is unwritable or on a noexec SDCARD partition
+
+### Changed
+- Refactored `print_changelog` to default to the latest version (`latest`) and support `all` or specific version queries
+- Trigger changelog panel display immediately upon completing `--tnode-update`
+
 ## [0.1.1] - 2026-08-04
 
 ### Added

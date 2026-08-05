@@ -418,6 +418,19 @@ fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Returns a valid, executable temporary directory for ELF caching and FIFO redirection.
+/// If `THOOK_TMPDIR` or `TMPDIR` is located on an SDCARD / FUSE mount (`/storage/` or `/sdcard/`),
+/// falls back to standard internal Termux storage (`/data/data/com.termux/files/usr/tmp`).
+fn get_valid_tmp_dir() -> String {
+    let tmp = std::env::var("THOOK_TMPDIR")
+        .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string()));
+    if tmp.contains("/storage/") || tmp.contains("/sdcard/") {
+        "/data/data/com.termux/files/usr/tmp".to_string()
+    } else {
+        tmp
+    }
+}
+
 /// Returns the path in `$TMPDIR` where a FIFO originally requested at
 /// `original_path_str` should be physically created.
 ///
@@ -437,8 +450,7 @@ fn get_fifo_tmp_path(original_path_str: &str) -> Option<String> {
     absolute.hash(&mut hasher);
     let hash_val = hasher.finish();
     
-    let tmp_dir = std::env::var("THOOK_TMPDIR")
-        .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string()));
+    let tmp_dir = get_valid_tmp_dir();
     
     let path = Path::new(original_path_str);
     let filename_only = path.file_name().unwrap_or_default().to_string_lossy();
@@ -574,8 +586,7 @@ fn copy_elf_to_tmp(filepath: &str) -> Option<String> {
     let metadata = std::fs::metadata(path).ok()?;
     let absolute_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     
-    let tmp_dir = std::env::var("THOOK_TMPDIR")
-        .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string()));
+    let tmp_dir = get_valid_tmp_dir();
     
     std::fs::create_dir_all(&tmp_dir).unwrap_or_default();
     
@@ -1234,8 +1245,7 @@ pub unsafe extern "C" fn thook_dlopen_rust(
             if let Ok(metadata) = std::fs::metadata(path) {
                 let absolute_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
                 
-                let tmp_dir = std::env::var("THOOK_TMPDIR")
-                    .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string()));
+                let tmp_dir = get_valid_tmp_dir();
                 std::fs::create_dir_all(&tmp_dir).unwrap_or_default();
                 
                 use std::collections::hash_map::DefaultHasher;

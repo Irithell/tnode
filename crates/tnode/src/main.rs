@@ -135,9 +135,13 @@ fn get_cache_dir() -> PathBuf {
 }
 
 /// Displays the changelog with colored indicators for Added (green), Changed (blue), Removed (red).
+/// Accepts `latest` (default), `all`, or a specific version like `0.1.1` or `v0.1.1`.
 fn print_changelog(target_version: Option<&str>) {
-    let target = target_version.map(|v| v.trim_start_matches('v'));
-    let mut in_target = target.is_none();
+    let raw_target = target_version.unwrap_or("latest").trim_start_matches('v');
+    let show_all = raw_target == "all";
+    let is_latest = raw_target == "latest";
+
+    let mut in_target = false;
     let mut found = false;
     let mut current_section = "";
     let mut last_printed_section = "";
@@ -150,8 +154,24 @@ fn print_changelog(target_version: Option<&str>) {
                 current_section = "";
                 last_printed_section = "";
 
-                if let Some(tgt) = target {
-                    if ver == tgt {
+                if is_latest {
+                    if found {
+                        break;
+                    }
+                    in_target = true;
+                    found = true;
+                    println!("\x1b[1mv{}\x1b[0m  \x1b[2m{}\x1b[0m", ver, date);
+                    println!("\x1b[2m────────────────────────────────────────────────────\x1b[0m");
+                } else if show_all {
+                    if found {
+                        println!();
+                    }
+                    found = true;
+                    in_target = true;
+                    println!("\x1b[1mv{}\x1b[0m  \x1b[2m{}\x1b[0m", ver, date);
+                    println!("\x1b[2m────────────────────────────────────────────────────\x1b[0m");
+                } else {
+                    if ver == raw_target {
                         if found {
                             break;
                         }
@@ -162,14 +182,6 @@ fn print_changelog(target_version: Option<&str>) {
                     } else {
                         in_target = false;
                     }
-                } else {
-                    if found {
-                        println!();
-                    }
-                    found = true;
-                    println!("\x1b[1mv{}\x1b[0m  \x1b[2m{}\x1b[0m", ver, date);
-                    println!("\x1b[2m────────────────────────────────────────────────────\x1b[0m");
-                    in_target = true;
                 }
             }
             continue;
@@ -203,20 +215,8 @@ fn print_changelog(target_version: Option<&str>) {
         println!();
         println!("  \x1b[32m●\x1b[0m \x1b[2madded\x1b[0m   \x1b[34m●\x1b[0m \x1b[2mchanged\x1b[0m   \x1b[31m●\x1b[0m \x1b[2mremoved\x1b[0m");
         println!();
-    } else if let Some(tgt) = target {
-        println!("[tnode] No changelog entry found for version v{}", tgt);
-    }
-}
-
-/// On startup, checks if the changelog for the current version has been shown.
-/// If not, displays the changelog once and saves the current version.
-fn check_and_show_new_changelog() {
-    let cache_dir = get_cache_dir();
-    let file_path = cache_dir.join("last_shown_changelog");
-    let last_shown = fs::read_to_string(&file_path).unwrap_or_default().trim().to_string();
-    if last_shown != VERSION {
-        print_changelog(Some(VERSION));
-        let _ = fs::write(&file_path, VERSION);
+    } else {
+        println!("[tnode] No changelog entry found for version '{}'", raw_target);
     }
 }
 
@@ -384,11 +384,8 @@ fn handle_update() {
 
     let _ = fs::remove_dir_all(&update_tmp);
 
-    // Reset last_shown_changelog so new changelog displays on next invocation
-    let cache_dir = get_cache_dir();
-    let _ = fs::write(cache_dir.join("last_shown_changelog"), "");
-
-    println!("\x1b[32m[tnode]\x1b[0m Successfully updated to {}!", latest_tag);
+    println!("\x1b[32m[tnode]\x1b[0m Successfully updated to {}!\n", latest_tag);
+    print_changelog(Some(&latest_ver));
 }
 
 /// Spawns a background thread to check for updates if 24h have passed since last check.
@@ -647,6 +644,28 @@ node = "{}"
     }
 }
 
+/// Validates whether a temporary directory path is suitable for ELF caching and FIFO redirection.
+///
+/// Returns `false` if the path:
+/// 1. Is located on an SDCARD / FUSE mount (`/storage/` or `/sdcard/`).
+/// 2. Cannot be created or is not writable.
+fn is_suitable_tmp_dir(path_str: &str) -> bool {
+    if path_str.contains("/storage/") || path_str.contains("/sdcard/") {
+        return false;
+    }
+    let p = Path::new(path_str);
+    if fs::create_dir_all(p).is_err() {
+        return false;
+    }
+    let test_file = p.join(".tnode_writable_test");
+    if fs::write(&test_file, "test").is_ok() {
+        let _ = fs::remove_file(test_file);
+        true
+    } else {
+        false
+    }
+}
+
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
     let mut iter = raw_args.into_iter().skip(1);
@@ -782,16 +801,54 @@ fn main() {
 
     let is_enabled = config.core.enabled.unwrap_or(true);
 
-    let resolved_lib_path = custom_lib.map(PathBuf::from)
-        .or_else(|| config.core.lib.as_ref().map(PathBuf::from))
-        .or_else(find_thook_lib);
+    let candidate_lib = custom_lib.map(PathBuf::from)
+        .or_else(|| config.core.lib.as_ref().map(PathBuf::from));
 
-    let resolved_tmp = custom_tmp
-        .or(config.core.tmp.clone())
-        .unwrap_or_else(|| {
-            env::var("THOOK_TMPDIR")
-                .unwrap_or_else(|_| env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string()))
-        });
+    let resolved_lib_path = match candidate_lib {
+        Some(path) => {
+            if path.exists() && path.is_file() {
+                Some(path)
+            } else {
+                log_warn!(
+                    "Configured libthook.so path '{}' does not exist or is invalid. Falling back to auto-discovery...",
+                    path.display()
+                );
+                find_thook_lib()
+            }
+        }
+        None => find_thook_lib(),
+    };
+
+    let default_tmp = env::var("THOOK_TMPDIR")
+        .unwrap_or_else(|_| env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string()));
+
+    let candidate_tmp = custom_tmp
+        .or(config.core.tmp.clone());
+
+    let resolved_tmp = match candidate_tmp {
+        Some(custom) => {
+            if is_suitable_tmp_dir(&custom) {
+                custom
+            } else {
+                log_warn!(
+                    "Custom temporary directory '{}' is invalid, unwritable, or located on a noexec SDCARD partition. Falling back to default: {}",
+                    custom, default_tmp
+                );
+                if is_suitable_tmp_dir(&default_tmp) {
+                    default_tmp
+                } else {
+                    "/data/data/com.termux/files/usr/tmp".to_string()
+                }
+            }
+        }
+        None => {
+            if is_suitable_tmp_dir(&default_tmp) {
+                default_tmp
+            } else {
+                "/data/data/com.termux/files/usr/tmp".to_string()
+            }
+        }
+    };
 
     if should_clean {
         handle_clean(&resolved_tmp);
@@ -873,9 +930,6 @@ fn main() {
 
     let debug_val = inject_debug.or(config.core.debug_level).unwrap_or_else(|| "off".to_string());
     let log_val = log_file.or(config.core.log);
-
-    // Show changelog on first execution of new version
-    check_and_show_new_changelog();
 
     // Check updates in background thread (cached 1x/24h)
     check_updates_background();
