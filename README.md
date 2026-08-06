@@ -161,9 +161,9 @@ required:
 └── install.sh             One-line installer
 ```
 
-## Installation (recommended)
+## Installation
 
-### One-line installer (Termux)
+### One-line installer (recommended)
 
 ```sh
 curl -fsSL https://github.com/Irithell/tnode/releases/latest/download/install.sh | bash
@@ -188,7 +188,7 @@ and install:
 
 ```sh
 # aarch64 (most Android phones)
-install -m755 tnode-aarch64-android     "$PREFIX/bin/tnode"
+install -m755 tnode-aarch64-android "$PREFIX/bin/tnode"
 install -m644 libthook-aarch64-android.so "$PREFIX/lib/libthook.so"
 ```
 
@@ -232,10 +232,10 @@ downloading it directly from the
 ### Build commands
 
 ```sh
-# Release build for aarch64 (Termux on most phones)
+# Release build for aarch64
 cargo build --target aarch64-linux-android --release
 
-# Release build for x86_64 (Android emulator)
+# Release build for x86_64
 cargo build --target x86_64-linux-android --release
 ```
 
