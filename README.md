@@ -1,18 +1,30 @@
-# tnode / thook
+<p align="center">
+  <img src="https://pub-5cd6924d31ff4d3aae9f8df4b3ae81f4.r2.dev/17a37b3760e65972e7536646a8828411" width="180" alt="TNode Logo" />
+</p>
 
-[![Latest Release](https://img.shields.io/github/v/release/Irithell/tnode?label=release&color=4a90e2)](https://github.com/Irithell/tnode/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Termux-brightgreen)](https://github.com/Irithell/tnode)
-[![Architecture](https://img.shields.io/badge/arch-aarch64%20%7C%20x86__64-orange)](https://github.com/Irithell/tnode/releases/latest)
-[![License](https://img.shields.io/github/license/Irithell/tnode)](LICENSE)
-[![Rust](https://img.shields.io/badge/built%20with-Rust-b7410e)](https://www.rust-lang.org)
+<h1 align="center">tnode / thook</h1>
 
-A POSIX compatibility shim and Node.js bridge for Android Termux.
+<p align="center">
+  <a href="https://github.com/Irithell/tnode/releases/latest"><img src="https://img.shields.io/github/v/release/Irithell/tnode?label=release&color=4a90e2" alt="Latest Release" /></a>
+  <a href="https://github.com/Irithell/tnode"><img src="https://img.shields.io/badge/platform-Android%20%7C%20Termux-brightgreen" alt="Platform" /></a>
+  <a href="https://github.com/Irithell/tnode/releases/latest"><img src="https://img.shields.io/badge/arch-aarch64%20%7C%20x86__64-orange" alt="Architecture" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Irithell/tnode" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/built%20with-Rust-b7410e" alt="Rust" /></a>
+</p>
+
+<p align="center">
+  <b>A POSIX compatibility shim and Node.js bridge for Android Termux.</b>
+</p>
 
 `libthook.so` is injected into any process via `LD_PRELOAD` and intercepts
 libc calls (`realpath`, `execve`, `dlopen`, `flock`, `fcntl`, `symlink`,
 `mkfifo`, `link`, and others) to transparently paper over Android's SDCARD
 filesystem restrictions. `tnode` is the CLI wrapper that configures the
 environment and launches any command with the library pre-loaded.
+
+<p align="center">
+  <img src="https://pub-5cd6924d31ff4d3aae9f8df4b3ae81f4.r2.dev/cda2e45e8a7ee513b36445b55321a7a5" width="100%" alt="TNode Banner" />
+</p>
 
 ---
 
