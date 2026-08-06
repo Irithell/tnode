@@ -294,12 +294,39 @@ safe to pipe through `eval`.
 
 ### `--tnode-doctor`
 
-Runs a checklist and exits with 0 on success or 1 on critical failures.
+Runs environment diagnostics (without relying on `which` being installed):
+1. Verifies `libthook.so` existence and accessibility.
+2. Validates TMPDIR existence and writability.
+3. Checks available free disk space in TMPDIR via `statvfs(2)`. Warns if < 50MB.
+4. Locates active `bridge.toml` across parent directories.
+5. Performs direct `$PATH` lookups for essential build tools (`node`, `npm`, `clang`, `python`, `bun`, `git`).
+6. Detects whether CWD is on internal storage or an SDCARD FUSE mount.
+7. Reads Android API level (`ro.build.version.sdk`) from `/system/build.prop` and warns about Android 12+ (API >= 31) Phantom Process Killer.
+8. Checks SELinux enforcing status (`/sys/fs/selinux/enforce`).
 
-### `--tnode-clean`
+Exits with 0 on success or 1 on critical errors.
 
-Deletes `thook_exec_*`, `thook_dl_*`, and `tnode_exec_*` files in `$TMPDIR`
-that are older than 24 hours.
+### `--tnode-stats`
+
+Displays a terminal table summarizing cache usage in `$TMPDIR` grouped by file prefix:
+- `thook_exec_*`: Cached ELF binary copies.
+- `thook_dl_*`: Cached shared library (`.node`) files.
+- `tnode_exec_*`: Cached process-level ELF copies.
+
+Reports count, total size formatted in B/KB/MB, and age of the oldest file.
+
+### `--tnode-completions <bash|zsh|fish>`
+
+Outputs shell completion scripts for `bash`, `zsh`, or `fish`. Compatible with `eval "$(tnode --tnode-completions bash)"` or redirecting into completion directories.
+
+### `--tnode-clean` / `--tnode-clean-max <MB>`
+
+- `--tnode-clean`: Deletes `thook_exec_*`, `thook_dl_*`, and `tnode_exec_*` files in `$TMPDIR` older than 24 hours.
+- `--tnode-clean-max <MB>`: Deletes any cache files exceeding the specified threshold in megabytes, regardless of age.
+
+### `--tnode-hook-log <hooks>`
+
+Forces trace-level logging for specific comma-separated hook names (e.g. `dlopen,execve`) by injecting `THOOK_LOG_HOOKS`. Allows debugging specific interception points without enabling global trace logs.
 
 ### `--tnode-update`
 
@@ -338,6 +365,13 @@ On every normal command execution, `check_updates_background()` is called before
 4. After the child exits, `print_pending_update_notice()` reads `~/.cache/tnode/latest_version`. If the cached tag differs from `VERSION`, a one-line notice is printed to stderr.
 
 The background thread must never block the main execution path. It is fire-and-forget.
+
+### `bridge.toml` discovery (`find_bridge_toml`)
+
+`find_bridge_toml()` walks parent directories starting from CWD looking for `bridge.toml`. The upward traversal stops as soon as a `bridge.toml` is found, or when hitting:
+- `$HOME` (`/data/data/com.termux/files/home`)
+- `/storage` or `/sdcard` mount points
+- Filesystem root (`/`)
 
 ### Path validation (`is_suitable_tmp_dir`)
 
@@ -380,6 +414,8 @@ tmp = "..."             # ELF cache and FIFO redirect directory.
 lib = "..."             # Path to libthook.so.
 log = "thook-{timestamp}.log"  # Log file. {timestamp} and {pid} macros supported.
 debug_level = "off"    # "off" | "error" | "warn" | "info" | "trace"
+hook_log = "dlopen,execve"  # Force trace logging for specific hooks
+root = true             # Anchors this directory as root for bridge.toml discovery
 
 [aliases]
 node = "/path/to/node"  # Short name -> full binary path
@@ -389,10 +425,19 @@ npm = ["--ignore-scripts"]  # Args prepended before user args for this command
 
 [env]
 PRISMA_CLIENT_ENGINE_TYPE = "binary"  # Injected into the child environment
+
+[hooks]
+# Disable specific syscall hooks per project (all true by default).
+# Valid names: realpath, symlink, symlinkat, chmod, fchmodat, flock, fcntl,
+#              syscall, execve, execvp, dlopen, mkfifo, mkfifoat, open, open64,
+#              openat, openat64, stat, lstat, stat64, lstat64, link, linkat,
+#              unlink, unlinkat, readlink, readlinkat
+# realpath = false
+# dlopen = false
 ```
 
-`bridge.toml` is read from the current working directory only. It is
-intentionally scoped like `.env` to avoid cross-project interference.
+`bridge.toml` is discovered by walking parent directories up to `$HOME` or `/sdcard`.
+It is scoped per project tree.
 
 ---
 

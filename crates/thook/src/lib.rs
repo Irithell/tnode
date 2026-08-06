@@ -162,6 +162,16 @@ static LOG_LEVEL: AtomicI32 = AtomicI32::new(0); // 0=off, 1=error, 2=warn, 3=in
 // File descriptor for the log output. -1 means stderr.
 static LOG_FD: AtomicI32 = AtomicI32::new(-1);
 
+// Comma-separated list of hook names that are disabled at runtime via
+// THOOK_DISABLE_HOOKS. Set by tnode from the bridge.toml [hooks] section.
+// Example: "realpath,dlopen"
+static DISABLED_HOOKS: OnceLock<String> = OnceLock::new();
+
+// Comma-separated list of hook names that always emit trace-level logs,
+// regardless of the global LOG_LEVEL. Set by tnode via THOOK_LOG_HOOKS.
+// Example: "dlopen,execve"
+static LOG_HOOKS: OnceLock<String> = OnceLock::new();
+
 /// Writes `msg` followed by a newline to the configured log destination.
 ///
 /// Uses `libc::write` directly to avoid any allocator or stdio re-entrancy
@@ -212,6 +222,18 @@ macro_rules! log_info {
 macro_rules! log_trace {
     ($($arg:tt)*) => {
         if LOG_LEVEL.load(Ordering::Relaxed) >= 4 {
+            debug_log_internal(&format!("\x1b[35m[thook:TRACE]\x1b[0m {}", format_args!($($arg)*)));
+        }
+    }
+}
+
+/// Emits a trace-level log unconditionally if `hook_name` is in THOOK_LOG_HOOKS,
+/// regardless of the global LOG_LEVEL. Falls through to the normal log_trace!
+/// check otherwise. This allows per-hook selective logging without enabling full
+/// trace mode.
+macro_rules! log_hook_trace {
+    ($hook:expr, $($arg:tt)*) => {
+        if LOG_LEVEL.load(Ordering::Relaxed) >= 4 || is_hook_logged($hook) {
             debug_log_internal(&format!("\x1b[35m[thook:TRACE]\x1b[0m {}", format_args!($($arg)*)));
         }
     }
@@ -336,6 +358,18 @@ fn init() {
                 LOG_LEVEL.store(4, Ordering::SeqCst);
             }
         }
+
+        if let Ok(disabled) = std::env::var("THOOK_DISABLE_HOOKS") {
+            if !disabled.is_empty() {
+                DISABLED_HOOKS.set(disabled).ok();
+            }
+        }
+
+        if let Ok(log_hooks) = std::env::var("THOOK_LOG_HOOKS") {
+            if !log_hooks.is_empty() {
+                LOG_HOOKS.set(log_hooks).ok();
+            }
+        }
         
         if let Ok(log_file) = std::env::var("THOOK_LOG_FILE") {
             let c_path = CString::new(log_file).unwrap_or_default();
@@ -360,6 +394,36 @@ fn init() {
             log_trace!("[thook:init] INFO: libthook.so loaded into Non-Node process: {}", exe.display());
         }
     }
+}
+
+/// Returns `true` if `hook_name` is present in the `THOOK_DISABLE_HOOKS` list.
+///
+/// Performs a zero-allocation scan over the comma-separated string stored in
+/// the `DISABLED_HOOKS` static. Called at the entry of every exported hook
+/// function to allow per-hook disabling via bridge.toml `[hooks]` section.
+fn is_hook_disabled(hook_name: &str) -> bool {
+    if let Some(list) = DISABLED_HOOKS.get() {
+        for name in list.split(',') {
+            if name.trim() == hook_name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns `true` if `hook_name` is present in the `THOOK_LOG_HOOKS` list,
+/// meaning trace-level logs should be emitted for this hook regardless of
+/// the global LOG_LEVEL setting.
+fn is_hook_logged(hook_name: &str) -> bool {
+    if let Some(list) = LOG_HOOKS.get() {
+        for name in list.split(',') {
+            if name.trim() == hook_name {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Allocates a new C string on the libc heap using `libc::malloc`.
@@ -649,6 +713,10 @@ pub unsafe extern "C" fn realpath(path: *const c_char, resolved_path: *mut c_cha
         None => return std::ptr::null_mut(),
     };
 
+    if is_hook_disabled("realpath") {
+        return orig_realpath(path, resolved_path);
+    }
+
     if path.is_null() {
         return orig_realpath(path, resolved_path);
     }
@@ -680,11 +748,8 @@ pub unsafe extern "C" fn realpath(path: *const c_char, resolved_path: *mut c_cha
         
         if resolved_str.starts_with(termux_prefix_normalized) {
             let path_abs = absolute_path(path_str);
-            // Apply the opaque strategy only when the original path was outside
-            // the prefix but the real resolution ended up inside it, i.e., a
-            // symlink on the SDCARD pointed into the Termux tree.
             if !path_abs.starts_with(termux_prefix_normalized) && result_str.starts_with(termux_prefix_normalized) {
-                log_trace!("[thook:realpath] ACTION: Applied opaque strategy. Redirected resolution from '{}' to '{}' [ptr: {:p}]", result_str, path_abs, path);
+                log_hook_trace!("realpath", "[thook:realpath] ACTION: Applied opaque strategy. Redirected resolution from '{}' to '{}' [ptr: {:p}]", result_str, path_abs, path);
                 
                 if !resolved_path.is_null() {
                     let path_abs_c = CString::new(path_abs).unwrap();
@@ -692,8 +757,6 @@ pub unsafe extern "C" fn realpath(path: *const c_char, resolved_path: *mut c_cha
                     std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, resolved_path, bytes.len());
                     return resolved_path;
                 } else {
-                    // resolved_path was NULL, so libc allocated the result buffer.
-                    // Replace it with a malloc buffer containing the opaque path.
                     let new_ptr = malloc_cstring(&path_abs);
                     if !new_ptr.is_null() {
                         libc::free(result_ptr as *mut libc::c_void);
@@ -719,6 +782,9 @@ pub unsafe extern "C" fn readlink(pathname: *const c_char, buf: *mut c_char, buf
         Some(f) => f,
         None => return -1,
     };
+    if is_hook_disabled("readlink") {
+        return orig_readlink(pathname, buf, bufsiz);
+    }
     orig_readlink(pathname, buf, bufsiz)
 }
 
@@ -732,6 +798,9 @@ pub unsafe extern "C" fn readlinkat(dirfd: libc::c_int, pathname: *const c_char,
         Some(f) => f,
         None => return -1,
     };
+    if is_hook_disabled("readlinkat") {
+        return orig_readlinkat(dirfd, pathname, buf, bufsiz);
+    }
     orig_readlinkat(dirfd, pathname, buf, bufsiz)
 }
 
@@ -748,6 +817,10 @@ pub unsafe extern "C" fn symlink(target: *const c_char, linkpath: *const c_char)
         Some(f) => f,
         None => return -1,
     };
+
+    if is_hook_disabled("symlink") {
+        return orig_symlink(target, linkpath);
+    }
 
     let target_str = if !target.is_null() { CStr::from_ptr(target).to_string_lossy().into_owned() } else { String::new() };
     let linkpath_str = if !linkpath.is_null() { CStr::from_ptr(linkpath).to_string_lossy().into_owned() } else { String::new() };
@@ -782,6 +855,10 @@ pub unsafe extern "C" fn symlinkat(target: *const c_char, newdirfd: libc::c_int,
         None => return -1,
     };
 
+    if is_hook_disabled("symlinkat") {
+        return orig_symlinkat(target, newdirfd, linkpath);
+    }
+
     let target_str = if !target.is_null() { CStr::from_ptr(target).to_string_lossy().into_owned() } else { String::new() };
     let linkpath_str = if !linkpath.is_null() { CStr::from_ptr(linkpath).to_string_lossy().into_owned() } else { String::new() };
     log_trace!("[thook:symlinkat] TRACE: Attempting to create symlinkat: '{}' -> '{}' (dirfd: {})", linkpath_str, target_str, newdirfd);
@@ -815,6 +892,10 @@ pub unsafe extern "C" fn chmod(pathname: *const c_char, mode: libc::mode_t) -> l
         None => return -1,
     };
 
+    if is_hook_disabled("chmod") {
+        return orig_chmod(pathname, mode);
+    }
+
     let pathname_str = if !pathname.is_null() { CStr::from_ptr(pathname).to_string_lossy().into_owned() } else { String::new() };
     log_trace!("[thook:chmod] TRACE: Attempting chmod {:o} on '{}'", mode, pathname_str);
 
@@ -842,6 +923,10 @@ pub unsafe extern "C" fn fchmodat(dirfd: libc::c_int, pathname: *const c_char, m
         Some(f) => f,
         None => return -1,
     };
+
+    if is_hook_disabled("fchmodat") {
+        return orig_fchmodat(dirfd, pathname, mode, flags);
+    }
 
     let pathname_str = if !pathname.is_null() { CStr::from_ptr(pathname).to_string_lossy().into_owned() } else { String::new() };
     log_trace!("[thook:fchmodat] TRACE: Attempting fchmodat {:o} on '{}' (dirfd: {}, flags: {})", mode, pathname_str, dirfd, flags);
@@ -883,7 +968,11 @@ pub unsafe extern "C" fn flock(fd: libc::c_int, operation: libc::c_int) -> libc:
         Some(f) => f,
         None => return -1,
     };
-    
+
+    if is_hook_disabled("flock") {
+        return orig_flock(fd, operation);
+    }
+
     log_trace!("[thook:flock] TRACE: Attempting flock on fd {} with op {}", fd, operation);
     let res = orig_flock(fd, operation);
     
@@ -913,6 +1002,10 @@ pub unsafe extern "C" fn fcntl(fd: libc::c_int, cmd: libc::c_int, arg: *mut libc
         Some(f) => f,
         None => return -1,
     };
+
+    if is_hook_disabled("fcntl") {
+        return orig_fcntl(fd, cmd, arg);
+    }
 
     log_trace!("[thook:fcntl] TRACE: Attempting fcntl on fd {} with cmd {}", fd, cmd);
     let res = orig_fcntl(fd, cmd, arg);
@@ -955,6 +1048,10 @@ pub unsafe extern "C" fn syscall(
         Some(f) => f,
         None => return -1,
     };
+
+    if is_hook_disabled("syscall") {
+        return orig_syscall(sysno, a1, a2, a3, a4, a5, a6);
+    }
 
     log_trace!("[thook:syscall] TRACE: Intercepted syscall sysno {}", sysno);
     let res = orig_syscall(sysno, a1, a2, a3, a4, a5, a6);
@@ -1010,6 +1107,11 @@ pub unsafe extern "C" fn execve(
     };
 
     let filename_str = if !filename.is_null() { CStr::from_ptr(filename).to_string_lossy().into_owned() } else { String::new() };
+
+    if is_hook_disabled("execve") {
+        return orig_execve(filename, argv, envp);
+    }
+
     log_trace!("[thook:execve] TRACE: Attempting to execute '{}'", filename_str);
     
     let res = orig_execve(filename, argv, envp);
@@ -1121,6 +1223,11 @@ pub unsafe extern "C" fn execvp(
     };
 
     let filename_str = if !filename.is_null() { CStr::from_ptr(filename).to_string_lossy().into_owned() } else { String::new() };
+
+    if is_hook_disabled("execvp") {
+        return orig_execvp(filename, argv);
+    }
+
     log_trace!("[thook:execvp] TRACE: Attempting to execute via execvp '{}'", filename_str);
     
     let res = orig_execvp(filename, argv);
@@ -1235,6 +1342,12 @@ pub unsafe extern "C" fn thook_dlopen_rust(
     }
     
     let filename_str = CStr::from_ptr(filename).to_string_lossy().into_owned();
+
+    if is_hook_disabled("dlopen") {
+        *call_orig = 1;
+        return std::ptr::null_mut();
+    }
+
     log_trace!("[thook:dlopen] TRACE: Attempting to load shared library '{}' (flags: {})", filename_str, flags);
     
     if filename_str.contains("/storage/") || filename_str.contains("/sdcard/") {
@@ -1306,7 +1419,11 @@ pub unsafe extern "C" fn mkfifo(pathname: *const c_char, mode: libc::mode_t) -> 
         Some(f) => f,
         None => return -1,
     };
-    
+
+    if is_hook_disabled("mkfifo") {
+        return orig_mkfifo(pathname, mode);
+    }
+
     let res = orig_mkfifo(pathname, mode);
     if res != 0 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1337,7 +1454,11 @@ pub unsafe extern "C" fn mkfifoat(dirfd: libc::c_int, pathname: *const c_char, m
         Some(f) => f,
         None => return -1,
     };
-    
+
+    if is_hook_disabled("mkfifoat") {
+        return orig_mkfifoat(dirfd, pathname, mode);
+    }
+
     let res = orig_mkfifoat(dirfd, pathname, mode);
     if res != 0 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1369,7 +1490,11 @@ pub unsafe extern "C" fn link(oldpath: *const c_char, newpath: *const c_char) ->
         Some(f) => f,
         None => return -1,
     };
-    
+
+    if is_hook_disabled("link") {
+        return orig_link(oldpath, newpath);
+    }
+
     let res = orig_link(oldpath, newpath);
     if res != 0 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1399,7 +1524,11 @@ pub unsafe extern "C" fn linkat(olddirfd: libc::c_int, oldpath: *const c_char, n
         Some(f) => f,
         None => return -1,
     };
-    
+
+    if is_hook_disabled("linkat") {
+        return orig_linkat(olddirfd, oldpath, newdirfd, newpath, flags);
+    }
+
     let res = orig_linkat(olddirfd, oldpath, newdirfd, newpath, flags);
     if res != 0 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1431,7 +1560,11 @@ macro_rules! define_open_hook {
                 Some(f) => f,
                 None => return -1,
             };
-            
+
+            if is_hook_disabled(stringify!($fn_name)) {
+                return orig_fn(pathname, flags, mode);
+            }
+
             let res = orig_fn(pathname, flags, mode);
             if res == -1 {
                 let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1463,7 +1596,11 @@ macro_rules! define_openat_hook {
                 Some(f) => f,
                 None => return -1,
             };
-            
+
+            if is_hook_disabled(stringify!($fn_name)) {
+                return orig_fn(dirfd, pathname, flags, mode);
+            }
+
             let res = orig_fn(dirfd, pathname, flags, mode);
             if res == -1 {
                 let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1496,7 +1633,11 @@ macro_rules! define_stat_hook {
                 Some(f) => f,
                 None => return -1,
             };
-            
+
+            if is_hook_disabled(stringify!($fn_name)) {
+                return orig_fn(pathname, statbuf);
+            }
+
             let res = orig_fn(pathname, statbuf);
             if res == -1 {
                 let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1539,7 +1680,11 @@ pub unsafe extern "C" fn unlink(pathname: *const c_char) -> libc::c_int {
         Some(f) => f,
         None => return -1,
     };
-    
+
+    if is_hook_disabled("unlink") {
+        return orig_unlink(pathname);
+    }
+
     let res = orig_unlink(pathname);
     let pathname_str = if !pathname.is_null() { CStr::from_ptr(pathname).to_string_lossy().into_owned() } else { String::new() };
     if let Some(tmp_path) = get_fifo_tmp_path(&pathname_str) {
@@ -1561,7 +1706,11 @@ pub unsafe extern "C" fn unlinkat(dirfd: libc::c_int, pathname: *const c_char, f
         Some(f) => f,
         None => return -1,
     };
-    
+
+    if is_hook_disabled("unlinkat") {
+        return orig_unlinkat(dirfd, pathname, flags);
+    }
+
     let res = orig_unlinkat(dirfd, pathname, flags);
     let pathname_str = if !pathname.is_null() { CStr::from_ptr(pathname).to_string_lossy().into_owned() } else { String::new() };
     if let Some(tmp_path) = get_fifo_tmp_path(&pathname_str) {

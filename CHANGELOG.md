@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.3] - 2026-08-06
+
+### Added
+- `--tnode-stats` — cache usage report grouped by file type (ELF copies, dlopen cache, pipe redirects)
+- `--tnode-completions <bash|zsh|fish>` — shell completion script generator (Bash, Zsh, Fish)
+- `--tnode-clean-max <MB>` — remove cache files exceeding a configurable size threshold
+- `--tnode-hook-log <hooks>` — force trace-level logs for specific hooks without enabling global trace mode (e.g. `dlopen,execve`)
+- `[hooks]` section in `bridge.toml` — per-project hook enable/disable with hook name validation
+- `[core] hook_log` in `bridge.toml` — persistent per-project selective hook logging
+- `[core] root = true` in `bridge.toml` — mark a directory as the root for upward bridge.toml discovery
+- `bridge.toml` ascending directory discovery — walks parent directories up to `$HOME` or `/sdcard` root
+- `--tnode-doctor` enhancements — direct `$PATH` lookup (no `which` dependency), Android API level detection, TMPDIR free disk space check via `statvfs(2)`, and SELinux status check
+- Runtime environment variables — `THOOK_DISABLE_HOOKS` and `THOOK_LOG_HOOKS`
+
+### Changed
+- Replaced `which` tool dependency in `handle_doctor` and `generate_default_config` with direct `$PATH` executable lookup
+
 ## [0.1.2] - 2026-08-05
 
 ### Added

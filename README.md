@@ -254,22 +254,27 @@ tnode --tnode-debug trace --tnode-log ./thook-{timestamp}.log npm run build
 | `--tnode-version` | Print version and exit |
 | `--tnode-update` | Download and install the latest release atomically |
 | `--tnode-changelog [version\|latest\|all]` | Display the changelog panel (default: latest version) |
+| `--tnode-stats` | Show cache usage statistics grouped by file type |
+| `--tnode-completions <shell>` | Generate shell completion script (`bash`, `zsh`, `fish`) |
 | `--tnode-lib <path>` | Use a custom `libthook.so` |
 | `--tnode-tmp <path>` | Override the ELF cache directory |
 | `--tnode-log <path>` | Write hook logs to a file (`{timestamp}` and `{pid}` macros supported) |
 | `--tnode-debug <level>` | Log level: `off`, `error`, `warn`, `info`, `trace` |
+| `--tnode-hook-log <hooks>` | Force trace-level logs for specific hooks (e.g. `dlopen,execve`) |
 | `--tnode-clean` | Delete cached ELF/library files older than 24 h |
+| `--tnode-clean-max <MB>` | Delete cache files exceeding a size threshold (in MB) |
 | `--tnode-init` | Generate a default `bridge.toml` in the current directory |
 | `--tnode-bridge-off` | Ignore `bridge.toml` for this invocation |
 | `--tnode-bridge-on` | Force-enable `bridge.toml` even if `core.enabled = false` |
 | `--tnode-env` | Print the active configuration and environment |
 | `--tnode-env-export` | Print `export` statements for use with `eval` |
-| `--tnode-doctor` | Run diagnostics |
+| `--tnode-doctor` | Run diagnostics (checks PATH, TMPDIR space, API level, SELinux) |
 
 ### bridge.toml
 
-`tnode` reads `bridge.toml` from the current working directory. Create a
-template with `tnode --tnode-init`.
+`tnode` searches for `bridge.toml` starting from the current working directory,
+walking up parent directories until `$HOME` or `/sdcard`. Create a template
+with `tnode --tnode-init`.
 
 ```toml
 [core]
@@ -278,6 +283,8 @@ tmp = "/data/data/com.termux/files/usr/tmp"
 lib = "/data/data/com.termux/files/usr/lib/libthook.so"
 # log = "thook-{timestamp}.log"
 debug_level = "off"
+# hook_log = "dlopen,execve"    # force trace-level logs for specific hooks
+root = true                     # anchor as root directory for bridge.toml discovery
 
 [aliases]
 # Map short names to full binary paths
@@ -290,6 +297,11 @@ node = "/data/data/com.termux/files/usr/bin/node"
 [env]
 # Environment variables injected into the child process
 # PRISMA_QUERY_ENGINE_LIBRARY = "/path/to/libquery_engine.so.node"
+
+[hooks]
+# Disable specific hooks per project (all enabled by default)
+# realpath = false
+# dlopen = false
 ```
 
 ### Using the environment export (eval mode)
@@ -307,8 +319,8 @@ node my-script.js
 tnode --tnode-doctor
 ```
 
-Checks for `libthook.so`, writable `$TMPDIR`, `bridge.toml`, and required
-tools in `$PATH`.
+Checks for `libthook.so`, writable `$TMPDIR`, free disk space via `statvfs(2)`,
+`bridge.toml` discovery, essential tools in `$PATH`, Android API level, and SELinux status.
 
 ## Environment variables
 
@@ -317,6 +329,8 @@ tools in `$PATH`.
 | `LD_PRELOAD` | Set by `tnode` to the `libthook.so` path |
 | `THOOK_DEBUG_LEVEL` | Log level (`error`, `warn`, `info`, `trace`) |
 | `THOOK_LOG_FILE` | Path for log output (supports `{timestamp}`, `{pid}`) |
+| `THOOK_LOG_HOOKS` | Comma-separated hook names to log at trace level |
+| `THOOK_DISABLE_HOOKS` | Comma-separated hook names to disable at runtime |
 | `THOOK_TMPDIR` | Directory for ELF cache and FIFO redirects |
 | `THOOK_LIB_PATH` | Explicit override for `libthook.so` discovery |
 | `PREFIX` | Termux prefix (default: `/data/data/com.termux/files/usr`) |
