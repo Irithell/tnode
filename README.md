@@ -30,31 +30,19 @@ environment and launches any command with the library pre-loaded.
 
 ## Table of contents
 
-- [How it works](#how-it-works)
-  - [ELF Copier bypass](#elf-copier-bypass)
-  - [Shebang bypass](#shebang-bypass-termux-exec-emulation)
-  - [FIFO redirection](#fifo-named-pipe-redirection)
-  - [dlopen namespace bypass](#dlopen-namespace-bypass)
-  - [Realpath opaque strategy](#realpath-opaque-strategy)
-  - [Known limits](#known-limits-ld_preload-boundary)
-- [Project structure](#project-structure)
-- [Installation](#installation-recommended)
-  - [One-line installer](#one-line-installer-termux)
-  - [Manual installation](#manual-installation)
-- [Building from source](#building-from-source)
-- [Usage](#usage)
-  - [Quick start](#quick-start)
-  - [CLI flags](#cli-flags-tnode-prefixed-to-avoid-conflicts-with-wrapped-commands)
-  - [bridge.toml](#bridgetoml)
-  - [Environment export](#using-the-environment-export-eval-mode)
-  - [Diagnostics](#diagnostics)
-- [Environment variables](#environment-variables)
-- [Scope of this tool](#scope-of-this-tool)
-- [Ecosystem compatibility](#ecosystem-compatibility)
-  - [canvas](#canvas)
-  - [better-sqlite3](#better-sqlite3)
-  - [puppeteer](#puppeteer)
-  - [Prisma](#prisma)
+<div align="center">
+
+[![How it Works](https://img.shields.io/badge/How_it_Works-1e1e2e?style=for-the-badge&labelColor=89b4fa&color=181825)](#how-it-works)
+[![Project Structure](https://img.shields.io/badge/Project_Structure-1e1e2e?style=for-the-badge&labelColor=b4befe&color=181825)](#project-structure)
+[![Installation](https://img.shields.io/badge/Installation-1e1e2e?style=for-the-badge&labelColor=cba6f7&color=181825)](#installation)
+[![Building](https://img.shields.io/badge/Building-1e1e2e?style=for-the-badge&labelColor=a6e3a1&color=181825)](#building-from-source)
+[![Usage](https://img.shields.io/badge/Usage-1e1e2e?style=for-the-badge&labelColor=f9e2af&color=181825)](#usage)
+[![bridge.toml](https://img.shields.io/badge/bridge.toml-1e1e2e?style=for-the-badge&labelColor=fab387&color=181825)](#bridgetoml)
+[![Diagnostics](https://img.shields.io/badge/Diagnostics-1e1e2e?style=for-the-badge&labelColor=f38ba8&color=181825)](#diagnostics)
+[![Environment](https://img.shields.io/badge/Environment-1e1e2e?style=for-the-badge&labelColor=74c7ec&color=181825)](#environment-variables)
+[![Ecosystem](https://img.shields.io/badge/Ecosystem-1e1e2e?style=for-the-badge&labelColor=94e2d5&color=181825)](#ecosystem-compatibility)
+
+</div>
 
 ---
 
@@ -502,9 +490,13 @@ PUPPETEER_SKIP_DOWNLOAD=true tnode npm install puppeteer
 
 The official Prisma query engine binaries are compiled for glibc-based Linux
 and cannot be executed on Android Bionic. Pre-compiled engine binaries
-targeting AArch64 Android are available at:
+targeting AArch64 Android are available:
 
-**<https://github.com/Irithell/prisma-termux/releases>**
+<p align="left">
+  <a href="https://github.com/Irithell/prisma-termux/releases">
+    <img src="https://img.shields.io/badge/Get_Bionic_Prisma_Engines-2D3748?style=for-the-badge&logo=prisma&logoColor=5A67D8&labelColor=1A202C" alt="Get Bionic Prisma Engines" />
+  </a>
+</p>
 
 If you require a version that is not listed there, open an issue in that
 repository.
