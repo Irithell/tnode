@@ -5,9 +5,13 @@ use std::fs;
 use std::collections::HashMap;
 use serde::Deserialize;
 
+// Read from Cargo.toml at compile time so --tnode-version always matches the crate version.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Embedded at compile-time for instant, zero-latency changelog rendering.
 const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
 
+/// List of valid syscall hook names supported by `libthook.so`.
 const VALID_HOOK_NAMES: &[&str] = &[
     "realpath", "symlink", "symlinkat", "chmod", "fchmodat",
     "flock", "fcntl", "syscall", "execve", "execvp",
@@ -36,6 +40,10 @@ macro_rules! log_info {
     };
 }
 
+/// Top-level configuration structure deserialized from `bridge.toml`.
+///
+/// `bridge.toml` is discovered by walking parent directories up to `$HOME` or `/sdcard`.
+/// All fields default to empty/disabled so a missing or partial file never causes a panic.
 #[derive(Deserialize, Default, Debug)]
 struct BridgeConfig {
     #[serde(default)]
@@ -50,6 +58,10 @@ struct BridgeConfig {
     hooks: HashMap<String, bool>,
 }
 
+/// Settings within the `[core]` section of `bridge.toml`.
+///
+/// All fields are `Option<T>` so that absent keys fall back to built-in
+/// defaults rather than producing a deserialization error.
 #[derive(Deserialize, Debug)]
 struct CoreConfig {
     enabled: Option<bool>,
@@ -76,6 +88,7 @@ impl Default for CoreConfig {
     }
 }
 
+/// Prints the help message to stdout and exits with code 0.
 fn print_help() {
     println!(r#"
   _____                 _      
@@ -129,10 +142,12 @@ EXAMPLES:
 "#, VERSION);
 }
 
+/// Prints the version string to stdout.
 fn print_version() {
     println!("tnode version {}", VERSION);
 }
 
+/// Returns the path to the user's tnode cache directory (`~/.cache/tnode`).
 fn get_cache_dir() -> PathBuf {
     let base = env::var("HOME")
         .map(PathBuf::from)
@@ -142,6 +157,8 @@ fn get_cache_dir() -> PathBuf {
     dir
 }
 
+/// Displays the changelog with colored indicators for Added (green), Changed (blue), Removed (red).
+/// Accepts `latest` (default), `all`, or a specific version like `0.1.1` or `v0.1.1`.
 fn print_changelog(target_version: Option<&str>) {
     let raw_target = target_version.unwrap_or("latest").trim_start_matches('v');
     let show_all = raw_target == "all";
@@ -218,6 +235,7 @@ fn print_changelog(target_version: Option<&str>) {
     }
 }
 
+/// Detects the target CPU architecture.
 fn detect_arch() -> Result<String, String> {
     match env::consts::ARCH {
         "aarch64" => Ok("aarch64".to_string()),
@@ -226,6 +244,7 @@ fn detect_arch() -> Result<String, String> {
     }
 }
 
+/// Detects the target platform (android or linux).
 fn detect_platform() -> Result<String, String> {
     match env::consts::OS {
         "linux" | "android" => {
@@ -240,6 +259,7 @@ fn detect_platform() -> Result<String, String> {
     }
 }
 
+/// Fetches the latest release tag_name from GitHub API via curl.
 fn fetch_latest_release_tag() -> Option<String> {
     let output = Command::new("curl")
         .args(["-fsSL", "--retry", "3",
@@ -259,6 +279,8 @@ fn fetch_latest_release_tag() -> Option<String> {
     None
 }
 
+/// Performs a self-update of tnode and libthook.so using atomic replacement.
+/// Displays the changelog panel of the new version after successful installation.
 fn handle_update() {
     println!("\x1b[36m[tnode]\x1b[0m Checking for updates...");
     let latest_tag = match fetch_latest_release_tag() {
@@ -311,9 +333,23 @@ fn handle_update() {
     if let Err(e) = replace_file(&tmp_lib, &target_lib) { log_err!("{}", e); exit(1); }
     let _ = fs::remove_dir_all(&update_tmp);
     println!("\x1b[32m[tnode]\x1b[0m Successfully updated to {}!\n", latest_tag);
-    print_changelog(Some(&latest_ver));
+
+    let cache_dir = get_cache_dir();
+    let _ = fs::write(cache_dir.join("latest_version"), &latest_tag);
+    let _ = fs::write(
+        cache_dir.join("last_check"),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default(),
+    );
+
+    if Command::new(&current_bin).arg("--tnode-changelog").arg(&latest_ver).status().is_err() {
+        print_changelog(Some(&latest_ver));
+    }
 }
 
+/// Spawns a background thread to check for updates if 24h have passed since last check.
 fn check_updates_background() {
     let cache_dir = get_cache_dir();
     let last_check_file = cache_dir.join("last_check");
@@ -333,6 +369,7 @@ fn check_updates_background() {
     }
 }
 
+/// Prints update notification on stderr if a newer version tag was found in cache.
 fn print_pending_update_notice() {
     let cache_dir = get_cache_dir();
     if let Ok(tag) = fs::read_to_string(cache_dir.join("latest_version")) {
@@ -389,6 +426,7 @@ fn free_bytes_at(path: &str) -> Option<u64> {
     }
 }
 
+/// Runs the `--tnode-doctor` diagnostic suite.
 fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path: Option<&PathBuf>, resolved_tmp: &str) {
     println!("\x1b[35m=== TNode System & Environment Doctor ===\x1b[0m\n");
     let mut errors = 0;
@@ -492,6 +530,7 @@ fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path
     if errors > 0 { exit(1); }
 }
 
+/// Displays a terminal table summarizing cache usage in `$TMPDIR` grouped by file prefix.
 fn handle_stats(tmp_dir: &str) {
     let path = Path::new(tmp_dir);
     if !path.exists() {
@@ -547,6 +586,7 @@ fn handle_stats(tmp_dir: &str) {
     println!();
 }
 
+/// Outputs shell completion scripts for `bash`, `zsh`, or `fish`.
 fn print_completions(shell: &str) {
     match shell {
         "bash" => println!(r#"# tnode bash completion
@@ -646,6 +686,7 @@ fn validate_hook_names(raw: &str) -> Option<String> {
     if valid.is_empty() { None } else { Some(valid.join(",")) }
 }
 
+/// Returns the absolute form of `path`, joining to CWD if relative.
 fn absolute_path(path: &str) -> String {
     let p = Path::new(path);
     if p.is_absolute() { return path.to_string(); }
@@ -677,6 +718,7 @@ fn find_bridge_toml() -> Option<PathBuf> {
     None
 }
 
+/// Searches for `libthook.so` in system paths.
 fn find_thook_lib() -> Option<PathBuf> {
     if let Ok(p) = env::var("THOOK_LIB_PATH") {
         let path = PathBuf::from(p);
@@ -694,6 +736,7 @@ fn find_thook_lib() -> Option<PathBuf> {
     None
 }
 
+/// Removes cached ELF and shared library files older than 24 hours from `tmp_dir`.
 fn handle_clean(tmp_dir: &str) {
     let path = Path::new(tmp_dir);
     if !path.exists() { log_info!("TMPDIR '{}' does not exist. Nothing to clean.", tmp_dir); return; }
@@ -722,6 +765,7 @@ fn handle_clean(tmp_dir: &str) {
     log_info!("Garbage collection complete: {} cleaned, {} active.", cleaned, skipped);
 }
 
+/// Removes cached ELF and shared library files exceeding `max_mb` in size.
 fn handle_clean_max(tmp_dir: &str, max_mb: u64) {
     let path = Path::new(tmp_dir);
     if !path.exists() { log_info!("TMPDIR '{}' does not exist. Nothing to clean.", tmp_dir); return; }
@@ -749,6 +793,7 @@ fn handle_clean_max(tmp_dir: &str, max_mb: u64) {
     log_info!("Size-based cleanup complete: {} cleaned, {} kept.", cleaned, skipped);
 }
 
+/// Writes a default `bridge.toml` to `config_path` if it does not already exist.
 fn generate_default_config(config_path: &Path) {
     if config_path.exists() { return; }
     let default_tmp = env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string());
@@ -785,6 +830,11 @@ node = "{}"
     }
 }
 
+/// Validates whether a temporary directory path is suitable for ELF caching and FIFO redirection.
+///
+/// Returns `false` if the path:
+/// 1. Is located on an SDCARD / FUSE mount (`/storage/` or `/sdcard/`).
+/// 2. Cannot be created or is not writable.
 fn is_suitable_tmp_dir(path_str: &str) -> bool {
     if path_str.contains("/storage/") || path_str.contains("/sdcard/") { return false; }
     let p = Path::new(path_str);
@@ -1072,6 +1122,8 @@ fn main() {
     }
 }
 
+/// Reads the shebang line from `filepath` and returns the interpreter path and
+/// any arguments embedded in the shebang line.
 fn get_shebang(filepath: &str) -> Option<Vec<String>> {
     use std::io::Read;
     let mut file = fs::File::open(filepath).ok()?;
@@ -1096,6 +1148,8 @@ fn get_shebang(filepath: &str) -> Option<Vec<String>> {
     None
 }
 
+/// Returns `true` if the first four bytes of `filepath` are the ELF magic
+/// number `\x7fELF`. Used to distinguish native binaries from scripts.
 fn is_elf(filepath: &str) -> bool {
     use std::io::Read;
     let mut file = match fs::File::open(filepath) { Ok(f) => f, Err(_) => return false };
@@ -1103,6 +1157,7 @@ fn is_elf(filepath: &str) -> bool {
     file.read_exact(&mut buffer).is_ok() && buffer == [0x7f, b'E', b'L', b'F']
 }
 
+/// Copies an ELF binary from the SDCARD to `tmp_dir` and returns the cached path.
 fn copy_elf_to_tmp(filepath: &str, tmp_dir: &str) -> Option<String> {
     let path = Path::new(filepath);
     let metadata = fs::metadata(path).ok()?;
