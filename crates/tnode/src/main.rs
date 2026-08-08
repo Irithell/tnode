@@ -240,6 +240,8 @@ fn detect_arch() -> Result<String, String> {
     match env::consts::ARCH {
         "aarch64" => Ok("aarch64".to_string()),
         "x86_64"  => Ok("x86_64".to_string()),
+        "arm"     => Ok("armv7".to_string()),
+        "x86"     => Ok("i686".to_string()),
         other     => Err(format!("Unsupported architecture: {}", other)),
     }
 }

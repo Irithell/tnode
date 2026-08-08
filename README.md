@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/Irithell/tnode/releases/latest"><img src="https://img.shields.io/github/v/release/Irithell/tnode?label=release&color=4a90e2" alt="Latest Release" /></a>
   <a href="https://github.com/Irithell/tnode"><img src="https://img.shields.io/badge/platform-Android%20%7C%20Termux-brightgreen" alt="Platform" /></a>
-  <a href="https://github.com/Irithell/tnode/releases/latest"><img src="https://img.shields.io/badge/arch-aarch64%20%7C%20x86__64-orange" alt="Architecture" /></a>
+  <a href="https://github.com/Irithell/tnode/releases/latest"><img src="https://img.shields.io/badge/arch-aarch64%20%7C%20x86__64%20%7C%20armv7%20%7C%20i686-orange" alt="Architecture" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Irithell/tnode" alt="License" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/built%20with-Rust-b7410e" alt="Rust" /></a>
 </p>

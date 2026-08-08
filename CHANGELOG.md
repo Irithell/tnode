@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.4] - 2026-08-08
+
+### Added
+- 32-bit Android architecture support for `armv7-linux-androideabi` (`armv7`) and `i686-linux-android` (`i686`)
+- Architecture detection in `install.sh` and `--tnode-update` for 32-bit `armv7` and `i686` targets
+- Generic pure-Rust atomic pointer fallback for 32-bit `dlopen` symbol interception
+
+### Changed
+- Replaced hardcoded syscall number `73` with portable `libc::SYS_flock` for cross-architecture 32-bit/64-bit support
+
 ## [0.1.3] - 2026-08-06
 
 ### Added

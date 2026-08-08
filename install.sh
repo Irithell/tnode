@@ -35,9 +35,11 @@ done
 
 detect_arch() {
     case "$(uname -m)" in
-        aarch64|arm64) echo "aarch64" ;;
-        x86_64|amd64)  echo "x86_64"  ;;
-        *) error "unsupported architecture: $(uname -m). TNode builds are provided for aarch64 and x86_64." ;;
+        aarch64|arm64)    echo "aarch64" ;;
+        x86_64|amd64)     echo "x86_64"  ;;
+        armv7l|armv7|arm) echo "armv7"   ;;
+        i686|i386|x86)    echo "i686"    ;;
+        *) error "unsupported architecture: $(uname -m). TNode builds are provided for aarch64, x86_64, armv7, and i686." ;;
     esac
 }
 

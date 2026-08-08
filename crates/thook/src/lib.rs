@@ -1057,7 +1057,7 @@ pub unsafe extern "C" fn syscall(
     let res = orig_syscall(sysno, a1, a2, a3, a4, a5, a6);
     if res == -1 {
         // SYS_fcntl and SYS_flock intercept for Go bypassing libc direct functions
-        if sysno == libc::SYS_fcntl || sysno == 73 /* SYS_flock */ {
+        if sysno == libc::SYS_fcntl || sysno == libc::SYS_flock {
             let fd = a1 as libc::c_int;
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if err == libc::ENOSYS || err == libc::EACCES || err == libc::EPERM || err == libc::EBADF {

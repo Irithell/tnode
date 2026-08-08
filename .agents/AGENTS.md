@@ -9,7 +9,7 @@ on this project. Read it in full before making any change to the codebase.
 
 The project is a POSIX compatibility shim and Node.js bridge for Android
 Termux. It is implemented as two Rust crates compiled for Android Bionic
-(`aarch64-linux-android` / `x86_64-linux-android`):
+(`aarch64-linux-android` / `x86_64-linux-android` / `armv7-linux-androideabi` / `i686-linux-android`):
 
 - **`thook`** (`crates/thook/src/lib.rs`): a `cdylib` that compiles to
   `libthook.so`. It is injected into any process via `LD_PRELOAD` and
