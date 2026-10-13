@@ -1,4 +1,5 @@
 /target/
 /.cargo/
 /dist/
+/tests/
 anotation.md

@@ -281,6 +281,20 @@ fn fetch_latest_release_tag() -> Option<String> {
     None
 }
 
+/// Returns true if `latest` is strictly newer than `current` according to semver (MAJOR.MINOR.PATCH).
+fn is_version_newer(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> (u32, u32, u32) {
+        let clean = v.trim_start_matches('v');
+        let mut parts = clean.split('.').filter_map(|s| s.parse::<u32>().ok());
+        (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        )
+    };
+    parse(latest) > parse(current)
+}
+
 /// Performs a self-update of tnode and libthook.so using atomic replacement.
 /// Displays the changelog panel of the new version after successful installation.
 fn handle_update() {
@@ -290,7 +304,7 @@ fn handle_update() {
         None => { log_err!("Failed to resolve latest version from GitHub API."); exit(1); }
     };
     let latest_ver = latest_tag.trim_start_matches('v');
-    if latest_ver == VERSION {
+    if !is_version_newer(&latest_ver, VERSION) {
         println!("\x1b[32m[tnode]\x1b[0m TNode is already up to date (v{}).", VERSION);
         exit(0);
     }
@@ -371,16 +385,42 @@ fn check_updates_background() {
     }
 }
 
-/// Prints update notification on stderr if a newer version tag was found in cache.
-fn print_pending_update_notice() {
+/// Prompts the user interactively if an update is available and the session is an interactive TTY.
+/// Falls back to a compact notice if non-interactive or if the user declines.
+fn check_and_prompt_update() {
+    use std::io::{IsTerminal, Write};
     let cache_dir = get_cache_dir();
-    if let Ok(tag) = fs::read_to_string(cache_dir.join("latest_version")) {
-        let tag = tag.trim();
-        let ver = tag.trim_start_matches('v');
-        if !ver.is_empty() && ver != VERSION {
-            eprintln!("\n\x1b[36m[tnode]\x1b[0m update available: v{} -> {}", VERSION, tag);
-            eprintln!("\x1b[36m[tnode]\x1b[0m run: tnode --tnode-update\n");
+    let tag = match fs::read_to_string(cache_dir.join("latest_version")) {
+        Ok(t) => t.trim().to_string(),
+        Err(_) => return,
+    };
+    let ver = tag.trim_start_matches('v');
+    if ver.is_empty() || !is_version_newer(ver, VERSION) {
+        return;
+    }
+
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        eprint!("\n\x1b[36m[tnode]\x1b[0m A new version is available: v{} -> {}\n", VERSION, tag);
+        eprint!("\x1b[36m[tnode]\x1b[0m Would you like to update now? [y/N]: ");
+        let _ = std::io::stderr().flush();
+
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let trimmed = input.trim().to_lowercase();
+            if trimmed == "y" || trimmed == "yes" {
+                eprintln!("\x1b[36m[tnode]\x1b[0m Starting update...\n");
+                handle_update();
+                return;
+            }
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+        let _ = fs::write(cache_dir.join("last_check"), now);
+    } else {
+        eprintln!("\n\x1b[36m[tnode]\x1b[0m update available: v{} -> {}", VERSION, tag);
+        eprintln!("\x1b[36m[tnode]\x1b[0m run: tnode --tnode-update\n");
     }
 }
 
@@ -413,6 +453,71 @@ fn read_android_api_level() -> Option<u32> {
     None
 }
 
+/// Reads an Android system property via libc on Android or fallback to getprop.
+fn get_android_prop(name: &str) -> Option<String> {
+    #[cfg(target_os = "android")]
+    unsafe {
+        let c_name = std::ffi::CString::new(name).ok()?;
+        let mut buf = [0 as libc::c_char; 92];
+        let len = libc::__system_property_get(c_name.as_ptr(), buf.as_mut_ptr());
+        if len > 0 {
+            let val = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().trim().to_string();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    if let Ok(output) = std::process::Command::new("/system/bin/getprop").arg(name).output() {
+        if output.status.success() {
+            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+enum SelinuxState {
+    Enforcing,
+    Permissive,
+    Inaccessible,
+}
+
+/// Inspects SELinux status using sysfs, system properties, and external getenforce.
+fn get_selinux_status() -> (SelinuxState, &'static str) {
+    if let Ok(val) = fs::read_to_string("/sys/fs/selinux/enforce") {
+        if val.trim() == "1" {
+            return (SelinuxState::Enforcing, "/sys/fs/selinux/enforce");
+        } else if val.trim() == "0" {
+            return (SelinuxState::Permissive, "/sys/fs/selinux/enforce");
+        }
+    }
+    if let Some(boot) = get_android_prop("ro.boot.selinux") {
+        if boot == "permissive" {
+            return (SelinuxState::Permissive, "ro.boot.selinux");
+        } else if boot == "enforcing" {
+            return (SelinuxState::Enforcing, "ro.boot.selinux");
+        }
+    }
+    if let Some(build) = get_android_prop("ro.build.selinux") {
+        if build == "1" {
+            return (SelinuxState::Enforcing, "ro.build.selinux");
+        }
+    }
+    if let Ok(output) = std::process::Command::new("getenforce").output() {
+        if output.status.success() {
+            let out = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            if out.contains("enforcing") {
+                return (SelinuxState::Enforcing, "getenforce");
+            } else if out.contains("permissive") || out.contains("disabled") {
+                return (SelinuxState::Permissive, "getenforce");
+            }
+        }
+    }
+    (SelinuxState::Inaccessible, "SELinux policy restricts unprivileged reads")
+}
+
 /// Returns free space in bytes for the filesystem containing `path` using statvfs(2).
 fn free_bytes_at(path: &str) -> Option<u64> {
     use std::mem::MaybeUninit;
@@ -429,7 +534,7 @@ fn free_bytes_at(path: &str) -> Option<u64> {
 }
 
 /// Runs the `--tnode-doctor` diagnostic suite.
-fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path: Option<&PathBuf>, resolved_tmp: &str) {
+fn handle_doctor(config_path: Option<&PathBuf>, config: &BridgeConfig, lib_path: Option<&PathBuf>, resolved_tmp: &str) {
     println!("\x1b[35m=== TNode System & Environment Doctor ===\x1b[0m\n");
     let mut errors = 0;
     let mut warnings = 0;
@@ -481,13 +586,24 @@ fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path
         _ => println!("\x1b[33m[INFO]\x1b[0m No bridge.toml found in directory tree."),
     }
 
-    // Essential tools (no dependency on `which`)
-    println!("\n\x1b[36mChecking essential tools in PATH:\x1b[0m");
-    for tool in &["node", "npm", "clang", "python", "bun", "git"] {
-        print!("  tool {:<8}: ", tool);
-        match find_in_path(tool) {
-            Some(p) => println!("\x1b[32m[FOUND]\x1b[0m at {}", p),
-            None    => { println!("\x1b[33m[NOT FOUND]\x1b[0m"); warnings += 1; }
+    // Primary runtime check
+    println!("\n\x1b[36mChecking runtime tools in PATH:\x1b[0m");
+    print!("  Node.js runtime: ");
+    match find_in_path("node") {
+        Some(p) => println!("\x1b[32m[FOUND]\x1b[0m at {}", p),
+        None => {
+            println!("\x1b[33m[NOT FOUND]\x1b[0m (install via 'pkg install nodejs')");
+            warnings += 1;
+        }
+    }
+    if !config.aliases.is_empty() {
+        println!("\n\x1b[36mChecking configured aliases from bridge.toml:\x1b[0m");
+        for (alias, target) in &config.aliases {
+            print!("  alias {:<12} -> {:<10}: ", alias, target);
+            match find_in_path(target) {
+                Some(p) => println!("\x1b[32m[FOUND]\x1b[0m at {}", p),
+                None => println!("\x1b[33m[NOT FOUND in PATH]\x1b[0m"),
+            }
         }
     }
 
@@ -496,7 +612,7 @@ fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path
     if let Ok(cwd) = env::current_dir() {
         let cwd_str = cwd.to_string_lossy();
         print!("  CWD: {} ", cwd_str);
-        if cwd_str.contains("/storage/") || cwd_str.contains("/sdcard/") {
+        if is_sdcard_path(&cwd_str) {
             println!("\x1b[33m[SDCARD/FUSE Mount Detected]\x1b[0m");
             println!("  -> libthook.so interception active for this session.");
         } else {
@@ -519,13 +635,18 @@ fn handle_doctor(config_path: Option<&PathBuf>, _config: &BridgeConfig, lib_path
 
     // SELinux
     print!("  SELinux status: ");
-    match fs::read_to_string("/sys/fs/selinux/enforce") {
-        Ok(val) if val.trim() == "1" => {
-            println!("\x1b[33m[WARN]\x1b[0m Enforcing. Some ROMs may restrict LD_PRELOAD in certain contexts.");
+    let (state, source) = get_selinux_status();
+    match state {
+        SelinuxState::Enforcing => {
+            println!("\x1b[33m[WARN]\x1b[0m Enforcing (via {}). Some ROMs may restrict LD_PRELOAD in certain contexts.", source);
             warnings += 1;
         }
-        Ok(_) => println!("\x1b[32m[Permissive or disabled]\x1b[0m"),
-        Err(_) => {} // inaccessible — silently skip
+        SelinuxState::Permissive => {
+            println!("\x1b[32m[Permissive or disabled]\x1b[0m (via {})", source);
+        }
+        SelinuxState::Inaccessible => {
+            println!("\x1b[36m[Inaccessible / Sandboxed]\x1b[0m ({})", source);
+        }
     }
 
     println!("\nDiagnostics complete: {} error(s), {} warning(s).", errors, warnings);
@@ -832,13 +953,37 @@ node = "{}"
     }
 }
 
+/// Returns true if `path` resides on an Android SDCARD / shared external storage mount.
+fn is_sdcard_path(path: &str) -> bool {
+    if path.starts_with("/storage/")
+        || path.starts_with("/sdcard/")
+        || path == "/sdcard"
+        || path.starts_with("/mnt/sdcard/")
+        || path.starts_with("/mnt/media_rw/")
+    {
+        return true;
+    }
+    if let Ok(canon) = fs::canonicalize(path) {
+        let s = canon.to_string_lossy();
+        if s.starts_with("/storage/")
+            || s.starts_with("/sdcard/")
+            || s == "/sdcard"
+            || s.starts_with("/mnt/sdcard/")
+            || s.starts_with("/mnt/media_rw/")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Validates whether a temporary directory path is suitable for ELF caching and FIFO redirection.
 ///
 /// Returns `false` if the path:
 /// 1. Is located on an SDCARD / FUSE mount (`/storage/` or `/sdcard/`).
 /// 2. Cannot be created or is not writable.
 fn is_suitable_tmp_dir(path_str: &str) -> bool {
-    if path_str.contains("/storage/") || path_str.contains("/sdcard/") { return false; }
+    if is_sdcard_path(path_str) { return false; }
     let p = Path::new(path_str);
     if fs::create_dir_all(p).is_err() { return false; }
     let test_file = p.join(".tnode_writable_test");
@@ -1097,11 +1242,53 @@ fn main() {
         }
         if let Some(ref disabled) = disable_hooks_val { cmd.env("THOOK_DISABLE_HOOKS", disabled); }
         if let Some(ref log_hooks) = log_hooks_val    { cmd.env("THOOK_LOG_HOOKS", log_hooks); }
+
+        // Guarantee $PREFIX/bin is present in PATH for child processes
+        let prefix = env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
+        let prefix_bin = format!("{}/bin", prefix);
+        let current_path = env::var("PATH").unwrap_or_default();
+        if !current_path.split(':').any(|p| p == prefix_bin) {
+            let new_path = if current_path.is_empty() { prefix_bin } else { format!("{}:{}", prefix_bin, current_path) };
+            cmd.env("PATH", new_path);
+        }
+
         cmd.status()
     };
 
-    match attempt_execution(&bin, &final_args) {
-        Ok(status) => { print_pending_update_notice(); exit(status.code().unwrap_or(0)); }
+    // Support direct execution of scripts (e.g. `tnode start.sh`, `tnode ./start.sh`)
+    let resolved_script_path = if Path::new(&bin).is_file() {
+        Some(bin.clone())
+    } else if !bin.contains('/') && Path::new(&format!("./{}", bin)).is_file() {
+        Some(format!("./{}", bin))
+    } else {
+        None
+    };
+
+    let result = if let Some(ref script_file) = resolved_script_path {
+        if is_elf(script_file) {
+            attempt_execution(script_file, &final_args)
+        } else if let Some(shebang_args) = get_shebang(script_file) {
+            let mut fallback_args = shebang_args;
+            fallback_args.push(script_file.clone());
+            fallback_args.extend(final_args.clone());
+            let interp = fallback_args.remove(0);
+            attempt_execution(&interp, &fallback_args)
+        } else if script_file.ends_with(".sh") || !is_elf(script_file) {
+            let prefix = env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
+            let sh_path = format!("{}/bin/sh", prefix);
+            let interp = if Path::new(&sh_path).exists() { sh_path } else { "/bin/sh".to_string() };
+            let mut fallback_args = vec![script_file.clone()];
+            fallback_args.extend(final_args.clone());
+            attempt_execution(&interp, &fallback_args)
+        } else {
+            attempt_execution(script_file, &final_args)
+        }
+    } else {
+        attempt_execution(&bin, &final_args)
+    };
+
+    match result {
+        Ok(status) => { check_and_prompt_update(); exit(status.code().unwrap_or(0)); }
         Err(e) => {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 log_warn!("EACCES executing '{}'. Attempting fallback...", bin);
@@ -1110,15 +1297,15 @@ fn main() {
                     fallback_args.push(bin.clone());
                     fallback_args.extend(final_args.clone());
                     let interp = fallback_args.remove(0);
-                    if let Ok(st) = attempt_execution(&interp, &fallback_args) { print_pending_update_notice(); exit(st.code().unwrap_or(0)); }
+                    if let Ok(st) = attempt_execution(&interp, &fallback_args) { check_and_prompt_update(); exit(st.code().unwrap_or(0)); }
                 } else if is_elf(&bin) {
                     if let Some(copied) = copy_elf_to_tmp(&bin, &resolved_tmp) {
-                        if let Ok(st) = attempt_execution(&copied, &final_args) { print_pending_update_notice(); exit(st.code().unwrap_or(0)); }
+                        if let Ok(st) = attempt_execution(&copied, &final_args) { check_and_prompt_update(); exit(st.code().unwrap_or(0)); }
                     }
                 }
             }
             log_err!("Failed to execute '{}': {}", bin, e);
-            print_pending_update_notice();
+            check_and_prompt_update();
             exit(1);
         }
     }
@@ -1139,9 +1326,32 @@ fn get_shebang(filepath: &str) -> Option<Vec<String>> {
             if !parts.is_empty() {
                 let prefix = env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
                 if parts[0] == "/bin/sh" || parts[0] == "/bin/bash" {
-                    parts[0] = format!("{}/bin/{}", prefix, if parts[0] == "/bin/sh" { "sh" } else { "bash" });
+                    let termux_sh = format!("{}/bin/{}", prefix, if parts[0] == "/bin/sh" { "sh" } else { "bash" });
+                    if Path::new(&termux_sh).exists() {
+                        parts[0] = termux_sh;
+                    }
                 } else if parts[0] == "/usr/bin/env" {
-                    parts[0] = format!("{}/bin/env", prefix);
+                    let direct = if parts.len() > 1 {
+                        let candidate = format!("{}/bin/{}", prefix, parts[1]);
+                        if Path::new(&candidate).exists() {
+                            Some(candidate)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(direct_binary) = direct {
+                        parts.remove(0);
+                        parts[0] = direct_binary;
+                    } else {
+                        let termux_env = format!("{}/bin/env", prefix);
+                        if Path::new(&termux_env).exists() {
+                            parts[0] = termux_env;
+                        } else {
+                            parts[0] = "/usr/bin/env".to_string();
+                        }
+                    }
                 }
                 return Some(parts);
             }

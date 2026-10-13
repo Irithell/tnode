@@ -482,13 +482,38 @@ fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Returns true if `path` resides on an Android SDCARD / shared external storage mount.
+/// Checks standard path prefix boundaries and resolves symlinks to avoid false positives.
+fn is_sdcard_path(path: &str) -> bool {
+    if path.starts_with("/storage/")
+        || path.starts_with("/sdcard/")
+        || path == "/sdcard"
+        || path.starts_with("/mnt/sdcard/")
+        || path.starts_with("/mnt/media_rw/")
+    {
+        return true;
+    }
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        let s = canon.to_string_lossy();
+        if s.starts_with("/storage/")
+            || s.starts_with("/sdcard/")
+            || s == "/sdcard"
+            || s.starts_with("/mnt/sdcard/")
+            || s.starts_with("/mnt/media_rw/")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Returns a valid, executable temporary directory for ELF caching and FIFO redirection.
-/// If `THOOK_TMPDIR` or `TMPDIR` is located on an SDCARD / FUSE mount (`/storage/` or `/sdcard/`),
+/// If `THOOK_TMPDIR` or `TMPDIR` is located on an SDCARD / FUSE mount,
 /// falls back to standard internal Termux storage (`/data/data/com.termux/files/usr/tmp`).
 fn get_valid_tmp_dir() -> String {
     let tmp = std::env::var("THOOK_TMPDIR")
         .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/data/data/com.termux/files/usr/tmp".to_string()));
-    if tmp.contains("/storage/") || tmp.contains("/sdcard/") {
+    if is_sdcard_path(&tmp) {
         "/data/data/com.termux/files/usr/tmp".to_string()
     } else {
         tmp
@@ -607,9 +632,32 @@ fn get_shebang(filepath: &str) -> Option<Vec<String>> {
             if !parts.is_empty() {
                 let prefix = std::env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
                 if parts[0] == "/bin/sh" || parts[0] == "/bin/bash" {
-                    parts[0] = format!("{}/bin/{}", prefix, if parts[0] == "/bin/sh" { "sh" } else { "bash" });
+                    let termux_sh = format!("{}/bin/{}", prefix, if parts[0] == "/bin/sh" { "sh" } else { "bash" });
+                    if Path::new(&termux_sh).exists() {
+                        parts[0] = termux_sh;
+                    }
                 } else if parts[0] == "/usr/bin/env" {
-                    parts[0] = format!("{}/bin/env", prefix);
+                    let direct = if parts.len() > 1 {
+                        let candidate = format!("{}/bin/{}", prefix, parts[1]);
+                        if Path::new(&candidate).exists() {
+                            Some(candidate)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(direct_binary) = direct {
+                        parts.remove(0);
+                        parts[0] = direct_binary;
+                    } else {
+                        let termux_env = format!("{}/bin/env", prefix);
+                        if Path::new(&termux_env).exists() {
+                            parts[0] = termux_env;
+                        } else {
+                            parts[0] = "/usr/bin/env".to_string();
+                        }
+                    }
                 }
                 return Some(parts);
             }
@@ -822,15 +870,13 @@ pub unsafe extern "C" fn symlink(target: *const c_char, linkpath: *const c_char)
         return orig_symlink(target, linkpath);
     }
 
-    let target_str = if !target.is_null() { CStr::from_ptr(target).to_string_lossy().into_owned() } else { String::new() };
-    let linkpath_str = if !linkpath.is_null() { CStr::from_ptr(linkpath).to_string_lossy().into_owned() } else { String::new() };
-    log_trace!("[thook:symlink] TRACE: Attempting to create symlink: '{}' -> '{}'", linkpath_str, target_str);
-
     let res = orig_symlink(target, linkpath);
     if res != 0 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let linkpath_str = if !linkpath.is_null() { CStr::from_ptr(linkpath).to_string_lossy().into_owned() } else { String::new() };
+        let target_str = if !target.is_null() { CStr::from_ptr(target).to_string_lossy().into_owned() } else { String::new() };
         if err == libc::EACCES || err == libc::EPERM {
-            if linkpath_str.contains("/storage/") || linkpath_str.contains("/sdcard/") {
+            if is_sdcard_path(&linkpath_str) {
                 log_trace!("[thook:symlink] WARN: EACCES/EPERM (errno: {}) detected on storage. Engaging fake symlink wrapper for '{}' -> '{}'", err, linkpath_str, target_str);
                 if handle_fake_symlink(&target_str, &linkpath_str) {
                     return 0;
@@ -859,15 +905,13 @@ pub unsafe extern "C" fn symlinkat(target: *const c_char, newdirfd: libc::c_int,
         return orig_symlinkat(target, newdirfd, linkpath);
     }
 
-    let target_str = if !target.is_null() { CStr::from_ptr(target).to_string_lossy().into_owned() } else { String::new() };
-    let linkpath_str = if !linkpath.is_null() { CStr::from_ptr(linkpath).to_string_lossy().into_owned() } else { String::new() };
-    log_trace!("[thook:symlinkat] TRACE: Attempting to create symlinkat: '{}' -> '{}' (dirfd: {})", linkpath_str, target_str, newdirfd);
-
     let res = orig_symlinkat(target, newdirfd, linkpath);
     if res != 0 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let linkpath_str = if !linkpath.is_null() { CStr::from_ptr(linkpath).to_string_lossy().into_owned() } else { String::new() };
+        let target_str = if !target.is_null() { CStr::from_ptr(target).to_string_lossy().into_owned() } else { String::new() };
         if err == libc::EACCES || err == libc::EPERM {
-            if linkpath_str.contains("/storage/") || linkpath_str.contains("/sdcard/") {
+            if is_sdcard_path(&linkpath_str) {
                 log_trace!("[thook:symlinkat] WARN: EACCES/EPERM (errno: {}) detected on storage. Engaging fake symlink wrapper for '{}' -> '{}'", err, linkpath_str, target_str);
                 handle_fake_symlink(&target_str, &linkpath_str);
                 return 0; 
@@ -896,14 +940,12 @@ pub unsafe extern "C" fn chmod(pathname: *const c_char, mode: libc::mode_t) -> l
         return orig_chmod(pathname, mode);
     }
 
-    let pathname_str = if !pathname.is_null() { CStr::from_ptr(pathname).to_string_lossy().into_owned() } else { String::new() };
-    log_trace!("[thook:chmod] TRACE: Attempting chmod {:o} on '{}'", mode, pathname_str);
-
     let res = orig_chmod(pathname, mode);
     if res != 0 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let pathname_str = if !pathname.is_null() { CStr::from_ptr(pathname).to_string_lossy().into_owned() } else { String::new() };
         if err == libc::EACCES || err == libc::EPERM {
-            if pathname_str.contains("/storage/") || pathname_str.contains("/sdcard/") {
+            if is_sdcard_path(&pathname_str) {
                 log_trace!("[thook:chmod] WARN: EACCES/EPERM (errno: {}) detected on storage for '{}' (mode: {:o}). Forcing success (0).", err, pathname_str, mode);
                 return 0;
             }
@@ -928,14 +970,12 @@ pub unsafe extern "C" fn fchmodat(dirfd: libc::c_int, pathname: *const c_char, m
         return orig_fchmodat(dirfd, pathname, mode, flags);
     }
 
-    let pathname_str = if !pathname.is_null() { CStr::from_ptr(pathname).to_string_lossy().into_owned() } else { String::new() };
-    log_trace!("[thook:fchmodat] TRACE: Attempting fchmodat {:o} on '{}' (dirfd: {}, flags: {})", mode, pathname_str, dirfd, flags);
-
     let res = orig_fchmodat(dirfd, pathname, mode, flags);
     if res != 0 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let pathname_str = if !pathname.is_null() { CStr::from_ptr(pathname).to_string_lossy().into_owned() } else { String::new() };
         if err == libc::EACCES || err == libc::EPERM {
-            if pathname_str.contains("/storage/") || pathname_str.contains("/sdcard/") {
+            if is_sdcard_path(&pathname_str) {
                 log_trace!("[thook:fchmodat] WARN: EACCES/EPERM (errno: {}) detected on storage for '{}' (mode: {:o}). Forcing success (0).", err, pathname_str, mode);
                 return 0;
             }
@@ -973,14 +1013,53 @@ pub unsafe extern "C" fn flock(fd: libc::c_int, operation: libc::c_int) -> libc:
         return orig_flock(fd, operation);
     }
 
-    log_trace!("[thook:flock] TRACE: Attempting flock on fd {} with op {}", fd, operation);
     let res = orig_flock(fd, operation);
     
     if res == -1 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if err == libc::ENOSYS || err == libc::EACCES || err == libc::EPERM || err == libc::EBADF {
             if let Some(path) = get_path_from_fd(fd) {
-                if path.contains("/storage/") || path.contains("/sdcard/") {
+                if is_sdcard_path(&path) {
+                    // SDCARD FUSE does not implement kernel flock(2).
+                    // Emulate flock via POSIX fcntl(F_SETLK/F_SETLKW) which is supported by kernel VFS
+                    // across processes, providing true mutual exclusion.
+                    let is_nb = (operation & libc::LOCK_NB) != 0;
+                    let op_type = operation & !libc::LOCK_NB;
+                    let fcntl_cmd = if is_nb { libc::F_SETLK } else { libc::F_SETLKW };
+                    let lock_type = match op_type {
+                        libc::LOCK_SH => Some(libc::F_RDLCK),
+                        libc::LOCK_EX => Some(libc::F_WRLCK),
+                        libc::LOCK_UN => Some(libc::F_UNLCK),
+                        _ => None,
+                    };
+
+                    if let Some(l_type) = lock_type {
+                        let mut flk = libc::flock {
+                            l_type: l_type as libc::c_short,
+                            l_whence: libc::SEEK_SET as libc::c_short,
+                            l_start: 0,
+                            l_len: 0,
+                            l_pid: 0,
+                        };
+                        let fcntl_res = if let Some(orig_fc) = ORIGINAL_FCNTL.get() {
+                            orig_fc(fd, fcntl_cmd, &mut flk as *mut _ as *mut libc::c_void)
+                        } else {
+                            libc::fcntl(fd, fcntl_cmd, &mut flk as *mut _ as *mut libc::c_void)
+                        };
+
+                        if fcntl_res == 0 {
+                            log_trace!("[thook:flock] ACTION: Emulated flock via fcntl on SDCARD for fd {}. Real mutual exclusion active.", fd);
+                            return 0;
+                        } else {
+                            let fcntl_err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                            if fcntl_err == libc::EAGAIN || fcntl_err == libc::EWOULDBLOCK || fcntl_err == libc::EDEADLK {
+                                log_trace!("[thook:flock] ACTION: Contested lock on fd {} (errno {}). Preserving error for mutual exclusion.", fd, fcntl_err);
+                                return -1;
+                            }
+                        }
+                    }
+
+                    // Fallback to safe success simulation only if fcntl emulation is also not supported
                     log_trace!("[thook:flock] ACTION: Ignored ENOSYS/EACCES on SDCARD for fd {} ('{}'). Forcing success.", fd, path);
                     return 0;
                 }
@@ -1007,14 +1086,13 @@ pub unsafe extern "C" fn fcntl(fd: libc::c_int, cmd: libc::c_int, arg: *mut libc
         return orig_fcntl(fd, cmd, arg);
     }
 
-    log_trace!("[thook:fcntl] TRACE: Attempting fcntl on fd {} with cmd {}", fd, cmd);
     let res = orig_fcntl(fd, cmd, arg);
 
     if res == -1 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if err == libc::ENOSYS || err == libc::EACCES || err == libc::EPERM || err == libc::EBADF {
             if let Some(path) = get_path_from_fd(fd) {
-                if path.contains("/storage/") || path.contains("/sdcard/") {
+                if is_sdcard_path(&path) {
                     log_trace!("[thook:fcntl] ACTION: Ignored ENOSYS/EACCES on SDCARD for fd {} ('{}') cmd {}. Forcing success.", fd, path, cmd);
                     return 0;
                 }
@@ -1062,7 +1140,7 @@ pub unsafe extern "C" fn syscall(
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if err == libc::ENOSYS || err == libc::EACCES || err == libc::EPERM || err == libc::EBADF {
                 if let Some(path) = get_path_from_fd(fd) {
-                    if path.contains("/storage/") || path.contains("/sdcard/") {
+                    if is_sdcard_path(&path) {
                         log_trace!("[thook:syscall] ACTION: Ignored ENOSYS/EACCES on SDCARD for sysno {} fd {} ('{}'). Forcing success.", sysno, fd, path);
                         return 0;
                     }
@@ -1106,17 +1184,17 @@ pub unsafe extern "C" fn execve(
         None => return -1,
     };
 
-    let filename_str = if !filename.is_null() { CStr::from_ptr(filename).to_string_lossy().into_owned() } else { String::new() };
-
     if is_hook_disabled("execve") {
         return orig_execve(filename, argv, envp);
     }
 
-    log_trace!("[thook:execve] TRACE: Attempting to execute '{}'", filename_str);
-    
+    // Call orig_execve first without any pre-allocations.
+    // In multi-threaded programs post-fork, heap allocations before execve risk deadlock.
+    // If orig_execve succeeds, it never returns.
     let res = orig_execve(filename, argv, envp);
     if res == -1 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let filename_str = if !filename.is_null() { CStr::from_ptr(filename).to_string_lossy().into_owned() } else { String::new() };
         if err == libc::EACCES {
             if let Some(shebang_args) = get_shebang(&filename_str) {
                 log_trace!("[thook:execve] INFO: EACCES on '{}', parsed shebang: {:?}", filename_str, shebang_args);
@@ -1138,8 +1216,9 @@ pub unsafe extern "C" fn execve(
                 let mut new_argv: Vec<*const c_char> = new_args.iter().map(|s| s.as_ptr()).collect();
                 new_argv.push(std::ptr::null());
                 
-                log_trace!("[thook:execve] ACTION: Rewriting execution to shebang target.");
-                return libc::execvp(new_argv[0], new_argv.as_ptr());
+                log_trace!("[thook:execve] ACTION: Rewriting execution to shebang target with preserved envp.");
+                // Preserve envp! Never discard envp via bare execvp
+                return orig_execve(new_argv[0], new_argv.as_ptr(), envp);
             } else if is_elf(&filename_str) {
                 log_trace!("[thook:execve] WARN: EACCES on ELF binary '{}'. Engaging ELF Copier Bypass...", filename_str);
                 if let Some(copied_path) = copy_elf_to_tmp(&filename_str) {
@@ -1198,6 +1277,34 @@ pub unsafe extern "C" fn execve(
                     
                     return orig_execve(copied_cstr.as_ptr(), new_argv.as_ptr(), envp);
                 }
+            } else if is_sdcard_path(&filename_str) && Path::new(&filename_str).is_file() {
+                let prefix = std::env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
+                let sh_path = format!("{}/bin/sh", prefix);
+                let interp = if Path::new(&sh_path).exists() { sh_path } else { "/bin/sh".to_string() };
+                let interp_cstr = CString::new(interp).unwrap();
+
+                let mut new_args = Vec::new();
+                new_args.push(interp_cstr.clone());
+                new_args.push(CString::new(filename_str.clone()).unwrap());
+
+                let mut i = 1;
+                if !argv.is_null() {
+                    while !(*argv.offset(i)).is_null() {
+                        new_args.push(CStr::from_ptr(*argv.offset(i)).to_owned());
+                        i += 1;
+                    }
+                }
+
+                let mut new_argv: Vec<*const c_char> = new_args.iter().map(|s| s.as_ptr()).collect();
+                new_argv.push(std::ptr::null());
+
+                let orig_execve = match ORIGINAL_EXECVE.get() {
+                    Some(f) => f,
+                    None => return -1,
+                };
+
+                log_trace!("[thook:execve] ACTION: SDCARD script without shebang '{}', invoking via sh.", filename_str);
+                return orig_execve(new_argv[0], new_argv.as_ptr(), envp);
             }
         } else {
             log_trace!("[thook:execve] ERROR: Failed to execute '{}' with errno {}", filename_str, err);
@@ -1222,17 +1329,14 @@ pub unsafe extern "C" fn execvp(
         None => return -1,
     };
 
-    let filename_str = if !filename.is_null() { CStr::from_ptr(filename).to_string_lossy().into_owned() } else { String::new() };
-
     if is_hook_disabled("execvp") {
         return orig_execvp(filename, argv);
     }
 
-    log_trace!("[thook:execvp] TRACE: Attempting to execute via execvp '{}'", filename_str);
-    
     let res = orig_execvp(filename, argv);
     if res == -1 {
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let filename_str = if !filename.is_null() { CStr::from_ptr(filename).to_string_lossy().into_owned() } else { String::new() };
         if err == libc::EACCES {
             if let Some(shebang_args) = get_shebang(&filename_str) {
                 log_trace!("[thook:execvp] INFO: EACCES on '{}', parsed shebang: {:?}", filename_str, shebang_args);
@@ -1278,6 +1382,29 @@ pub unsafe extern "C" fn execvp(
                     log_trace!("[thook:execvp] SUCCESS: Execution redirected to cached ELF.");
                     return libc::execvp(copied_cstr.as_ptr(), new_argv.as_ptr());
                 }
+            } else if is_sdcard_path(&filename_str) && Path::new(&filename_str).is_file() {
+                let prefix = std::env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".to_string());
+                let sh_path = format!("{}/bin/sh", prefix);
+                let interp = if Path::new(&sh_path).exists() { sh_path } else { "/bin/sh".to_string() };
+                let interp_cstr = CString::new(interp).unwrap();
+
+                let mut new_args = Vec::new();
+                new_args.push(interp_cstr.clone());
+                new_args.push(CString::new(filename_str.clone()).unwrap());
+
+                let mut i = 1;
+                if !argv.is_null() {
+                    while !(*argv.offset(i)).is_null() {
+                        new_args.push(CStr::from_ptr(*argv.offset(i)).to_owned());
+                        i += 1;
+                    }
+                }
+
+                let mut new_argv: Vec<*const c_char> = new_args.iter().map(|s| s.as_ptr()).collect();
+                new_argv.push(std::ptr::null());
+
+                log_trace!("[thook:execvp] ACTION: SDCARD script without shebang '{}', invoking via sh.", filename_str);
+                return libc::execvp(new_argv[0], new_argv.as_ptr());
             }
         } else {
             log_trace!("[thook:execvp] ERROR: Failed to execute '{}' with errno {}", filename_str, err);
@@ -1350,7 +1477,7 @@ pub unsafe extern "C" fn thook_dlopen_rust(
 
     log_trace!("[thook:dlopen] TRACE: Attempting to load shared library '{}' (flags: {})", filename_str, flags);
     
-    if filename_str.contains("/storage/") || filename_str.contains("/sdcard/") {
+    if is_sdcard_path(&filename_str) {
         log_trace!("[thook:dlopen] WARN: Android Bionic linker namespace restriction detected on '{}'. Engaging cache bypass...", filename_str);
         
         let path = Path::new(&filename_str);
@@ -1501,7 +1628,7 @@ pub unsafe extern "C" fn link(oldpath: *const c_char, newpath: *const c_char) ->
         if err == libc::EACCES || err == libc::EPERM || err == libc::ENOSYS {
             let oldpath_str = if !oldpath.is_null() { CStr::from_ptr(oldpath).to_string_lossy().into_owned() } else { String::new() };
             let newpath_str = if !newpath.is_null() { CStr::from_ptr(newpath).to_string_lossy().into_owned() } else { String::new() };
-            if newpath_str.contains("/storage/") || newpath_str.contains("/sdcard/") {
+            if is_sdcard_path(&newpath_str) {
                 log_warn!("[thook:link] WARN: EACCES/EPERM on SDCARD for link '{}' -> '{}'. Engaging fallback physical copy (Hard link semantics lost!)", oldpath_str, newpath_str);
                 if let Err(e) = copy_recursive(Path::new(&oldpath_str), Path::new(&newpath_str)) {
                     log_error!("[thook:link] ERROR: Fallback copy failed: {}", e);
@@ -1535,7 +1662,7 @@ pub unsafe extern "C" fn linkat(olddirfd: libc::c_int, oldpath: *const c_char, n
         if err == libc::EACCES || err == libc::EPERM || err == libc::ENOSYS {
             let oldpath_str = if !oldpath.is_null() { CStr::from_ptr(oldpath).to_string_lossy().into_owned() } else { String::new() };
             let newpath_str = if !newpath.is_null() { CStr::from_ptr(newpath).to_string_lossy().into_owned() } else { String::new() };
-            if newpath_str.contains("/storage/") || newpath_str.contains("/sdcard/") {
+            if is_sdcard_path(&newpath_str) {
                 log_warn!("[thook:linkat] WARN: EACCES/EPERM on SDCARD for linkat '{}' -> '{}'. Engaging fallback physical copy.", oldpath_str, newpath_str);
                 if let Err(e) = copy_recursive(Path::new(&absolute_path(&oldpath_str)), Path::new(&absolute_path(&newpath_str))) {
                     log_error!("[thook:linkat] ERROR: Fallback copy failed: {}", e);

@@ -69,7 +69,7 @@ standard POSIX tooling:
 | `execve`/`execvp` on noexec | Shebang rewrite (shell scripts) or ELF Copier (native binaries) |
 | `symlink`/`symlinkat` | Wrapper shell script (`.bin`) or physical copy |
 | `chmod`/`fchmodat` | Silently return 0 |
-| `flock`/`fcntl`/`syscall` locking | Return 0 when fd is on SDCARD |
+| `flock`/`fcntl`/`syscall` locking | Emulate `flock` via POSIX `fcntl(F_SETLK/F_SETLKW)` on SDCARD for true mutual exclusion; fallback to 0 only if unsupported |
 | `mkfifo`/`mkfifoat` | Redirect creation to `$TMPDIR` |
 | `open`/`openat`/`stat` on a missing pipe | Redirect to `$TMPDIR` counterpart |
 | `dlopen` from SDCARD | Copy to `$TMPDIR`, open the copy |
@@ -225,6 +225,12 @@ cargo build --target aarch64-linux-android --release
 
 # Release build for x86_64
 cargo build --target x86_64-linux-android --release
+
+# Release build for armv7 (32-bit ARM)
+cargo build --target armv7-linux-androideabi --release
+
+# Release build for i686 (32-bit x86)
+cargo build --target i686-linux-android --release
 ```
 
 Artifacts are placed in `target/<triple>/release/`:
@@ -236,6 +242,10 @@ Artifacts are placed in `target/<triple>/release/`:
 ### Quick start
 
 ```sh
+# Execute shell scripts directly on SDCARD or internal storage
+tnode start.sh
+tnode ./build.sh --production
+
 # Run npm with the hook active
 tnode npm install canvas
 
@@ -320,7 +330,7 @@ tnode --tnode-doctor
 ```
 
 Checks for `libthook.so`, writable `$TMPDIR`, free disk space via `statvfs(2)`,
-`bridge.toml` discovery, essential tools in `$PATH`, Android API level, and SELinux status.
+`bridge.toml` discovery, Node.js runtime and configured aliases in `$PATH`, Android API level, and SELinux status.
 
 ## Environment variables
 

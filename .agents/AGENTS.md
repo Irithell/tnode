@@ -193,22 +193,31 @@ layer does not support permission bits.
 
 ### `flock` / `fcntl` / `syscall`
 
-On any locking-related error (`ENOSYS`, `EACCES`, `EPERM`, `EBADF`) for an
-fd whose `/proc/self/fd/<fd>` symlink resolves into `/storage/` or `/sdcard/`:
-returns 0. This simulates a successful lock acquisition.
+On SDCARD paths (verified via `is_sdcard_path`):
+- `flock(2)` fails with `ENOSYS` on Android's SDCARD FUSE. The hook emulates `flock`
+  using POSIX `fcntl(F_SETLK/F_SETLKW)` record locks (`F_RDLCK` for `LOCK_SH`,
+  `F_WRLCK` for `LOCK_EX`, `F_UNLCK` for `LOCK_UN`). Because the Linux kernel VFS
+  handles advisory record locks across processes, this provides **true mutual exclusion**.
+  If a lock conflict occurs (`EAGAIN` / `EWOULDBLOCK`), the error is returned so runtimes
+  and databases (like SQLite) correctly recognize contention. If `fcntl` is also
+  unsupported by the filesystem, returns 0 as a safe fallback.
+- `fcntl(2)` on `F_SETLK`/`F_SETLKW` returns 0 on `ENOSYS`/`EACCES`/`EPERM`, but preserves
+  `EAGAIN`/`EWOULDBLOCK` on contention.
 
-`syscall` intercepts `SYS_fcntl` and `SYS_flock` (number 73 on aarch64) for
-runtimes that call locking through the libc `syscall()` wrapper.
+`syscall` intercepts `SYS_fcntl` and `SYS_flock` for runtimes that call locking through
+the libc `syscall()` wrapper.
 
 ### `execve` / `execvp`
 
+Allocations are deferred: `orig_execve` is called immediately without any heap allocations.
 On `EACCES` (noexec SDCARD):
 
 1. **Shebang bypass**: reads up to 256 bytes of the target file. If it starts
    with `#!`, reconstructs `argv` with the interpreter at position 0 and the
-   original filename inserted before the user's arguments. Interpreter paths
-   `/bin/sh`, `/bin/bash`, `/usr/bin/env` are rewritten to their Termux
-   equivalents (`$PREFIX/bin/sh`, etc.) to preserve `LD_PRELOAD`.
+   original filename inserted before the user's arguments. Direct resolution is
+   applied: `#!/usr/bin/env <cmd>` resolves directly to `$PREFIX/bin/<cmd>` if it
+   exists. The caller's `envp` environment array is strictly preserved by calling
+   `orig_execve(new_argv[0], new_argv.as_ptr(), envp)` instead of dropping it via `execvp`.
 2. **ELF Copier bypass**: checks for the `\x7fELF` magic. If the file is an
    ELF binary, copies it to `$TMPDIR/thook_exec_<hash>_<name>` and re-executes
    from there.
@@ -299,10 +308,10 @@ Runs environment diagnostics (without relying on `which` being installed):
 2. Validates TMPDIR existence and writability.
 3. Checks available free disk space in TMPDIR via `statvfs(2)`. Warns if < 50MB.
 4. Locates active `bridge.toml` across parent directories.
-5. Performs direct `$PATH` lookups for essential build tools (`node`, `npm`, `clang`, `python`, `bun`, `git`).
+5. Checks the Node.js runtime (`node`) and configured aliases in `bridge.toml`.
 6. Detects whether CWD is on internal storage or an SDCARD FUSE mount.
 7. Reads Android API level (`ro.build.version.sdk`) from `/system/build.prop` and warns about Android 12+ (API >= 31) Phantom Process Killer.
-8. Checks SELinux enforcing status (`/sys/fs/selinux/enforce`).
+8. Checks SELinux enforcing status via `/sys/fs/selinux/enforce`, Android system properties (`ro.boot.selinux`, `ro.build.selinux`), and `getenforce`.
 
 Exits with 0 on success or 1 on critical errors.
 

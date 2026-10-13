@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.5] - 2026-10-12
+
+### Added
+- Direct execution support for shell scripts (`tnode start.sh`, `tnode ./start.sh`) with intelligent interpreter discovery and shell fallback
+- Interactive update prompt (Oh-My-Zsh style) when updates are available on interactive TTY sessions, with 24-hour deferral on skip
+- True cross-process mutual exclusion for `flock(2)` on SDCARD by emulating locks via POSIX `fcntl(F_SETLK/F_SETLKW)`
+- Centralized `is_sdcard_path` detection using prefix boundaries and symlink canonicalization, eliminating false positives from internal paths
+- Android system property inspection (`ro.build.selinux`, `ro.boot.selinux`) for `--tnode-doctor` under sandboxed app domains
+
+### Changed
+- Preserved `envp` environment in `execve` shebang rewrites, eliminating child process environment loss
+- Resolved `#!/usr/bin/env <cmd>` directly to `$PREFIX/bin/<cmd>`, resolving `env: "node: No such file or directory"` failures
+- Guaranteed `$PREFIX/bin` presence in child process `PATH`
+- Refactored `--tnode-doctor` tool validation: replaced arbitrary essential tools list with Node.js runtime and configured project aliases
+- Fixed dangling SELinux status output in `--tnode-doctor`
+- Deferred string allocations in `libthook` `execve`/`execvp` until failure path, guaranteeing post-fork async-signal safety
+
 ## [0.1.4] - 2026-08-08
 
 ### Added

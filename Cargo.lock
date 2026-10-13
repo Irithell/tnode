@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "thook"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ctor",
  "libc",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "tnode"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libc",
  "serde",
